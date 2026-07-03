@@ -1,5 +1,5 @@
 /**
-name = "mycloud"
+name = "mycloud 0.03"
 
 [[kv_namespaces]]
 binding = "KV_STORE"
@@ -178,7 +178,11 @@ function getPreviewType(filename) {
     return 'pdf';
   }
 
-  if (['txt', 'md', 'json', 'js', 'ts', 'css', 'html', 'htm', 'xml', 'yaml', 'yml', 'ini', 'conf', 'cfg', 'sh', 'bash', 'zsh', 'py', 'php', 'java', 'c', 'cpp', 'h', 'hpp', 'go', 'rs', 'rb', 'lua', 'swift', 'kt', 'scala', 'r', 'vue', 'tsx', 'jsx', 'toml', 'csv', 'sql', 'log', 'bat', 'ps1', 'makefile', 'dockerfile', 'gitignore', 'env', 'properties', 'pl', 'pm', 'coffee', 'dart', 'tf', 'proto'].includes(ext)) {
+  if (['html', 'htm'].includes(ext)) {
+    return 'html';
+  }
+//扩充编程文件扩展名列表
+  if (['txt', 'md', 'json', 'js', 'ts', 'css', 'xml', 'yaml', 'yml', 'ini', 'conf', 'sh', 'py', 'php', 'java', 'c', 'cpp', 'h', 'go', 'rs', 'rb', 'vue', 'tsx', 'jsx', 'toml', 'sql', 'log', 'bat', 'ps1', 'html', 'htm'].includes(ext)) {
     return 'text';
   }
 
@@ -1506,6 +1510,7 @@ const CSS_STYLES = `
   [data-theme="dark"] .header { background: rgba(28,28,30,0.72); }
   [data-theme="dark"] .btn-secondary { background: rgba(255,255,255,0.08); }
   [data-theme="dark"] .btn-secondary:hover { background: rgba(255,255,255,0.14); }
+  [data-theme="dark"] .new-file-dropdown > .new-file-dropdown-btn { border-left-color: rgba(255,255,255,0.15); }
   [data-theme="dark"] .login-container { background: #000; }
   [data-theme="dark"] .preview-text { background: #2c2c2e; color: #f5f5f7; }
   [data-theme="dark"] .preview-markdown { background: #2c2c2e; color: #f5f5f7; }
@@ -1582,6 +1587,28 @@ const CSS_STYLES = `
     background: #e0352b;
   }
   .btn-sm { padding: 5px 12px; font-size: 12px; }
+  .new-file-dropdown { display: inline-flex; align-items: stretch; position: relative; }
+  .new-file-dropdown > .btn { border-radius: 0; }
+  .new-file-dropdown > .btn:first-child { border-radius: var(--radius-sm) 0 0 var(--radius-sm); }
+  .new-file-dropdown > .new-file-dropdown-btn {
+    border-radius: 0 var(--radius-sm) var(--radius-sm) 0;
+    border-left: 1px solid rgba(255,255,255,0.25);
+    padding: 8px 10px; min-width: 30px;
+  }
+  .new-file-dropdown-menu {
+    position: absolute; top: calc(100% + 4px); left: 0; z-index: 9999; min-width: 130px;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius-sm); box-shadow: 0 8px 24px rgba(0,0,0,0.15);
+    overflow: hidden; display: none;
+  }
+  .new-file-dropdown-menu.active { display: block; }
+  .new-file-dropdown-menu.dropup { top: auto; bottom: calc(100% + 4px); }
+  .new-file-dropdown-item {
+    display: flex; align-items: center; gap: 6px;
+    padding: 6px 14px; font-size: 12px; cursor: pointer;
+    transition: background var(--transition); color: var(--text);
+  }
+  .new-file-dropdown-item:hover { background: rgba(0,122,255,0.08); color: var(--primary); }
   .form-group { margin-bottom: 18px; }
   .form-label {
     display: block; margin-bottom: 6px; font-size: 13px; font-weight: 500;
@@ -1825,6 +1852,7 @@ const CSS_STYLES = `
     color: #1d1d1f;
   }
   .preview-pdf { width: 100%; height: 100%; border: none; border-radius: var(--radius-sm); }
+  .preview-html { width: 100%; height: 100%; border: none; border-radius: var(--radius-sm); background: #fff; }
   .preview-video, .preview-audio { max-width: 100%; max-height: 100%; }
   .preview-markdown {
     width: 100%; max-width: 900px; height: 100%;
@@ -1991,7 +2019,7 @@ const CSS_STYLES = `
   .editor-toolbar {
     display: flex; align-items: center; gap: 4px; padding: 5px 10px;
     background: #2d2d2d; border-bottom: 1px solid #404040;
-    user-select: none; cursor: move; flex-shrink: 0;
+    user-select: none; cursor: move; flex-shrink: 0; position: relative;
   }
   .editor-toolbar-spacer { flex: 1; }
   .editor-toolbar-sep { width: 1px; background: #404040; height: 18px; margin: 0 4px; }
@@ -2008,6 +2036,24 @@ const CSS_STYLES = `
     color: #fff; font-size: 11px; font-family: 'SF Mono', monospace; flex-shrink: 0; user-select: none;
   }
   .editor-status-encoding { margin-left: auto; }
+  .editor-encoding-menu {
+    position: absolute; top: 100%; right: 10px; min-width: 200px;
+    background: #2d2d2d; border: 1px solid #454545; border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.5); padding: 4px 0;
+    z-index: 10000; display: none;
+  }
+  .editor-encoding-menu.open { display: block; }
+  .editor-encoding-menu-item {
+    padding: 6px 24px 6px 32px; cursor: pointer; color: #ccc;
+    font-size: 12px; line-height: 1.4; white-space: nowrap;
+    display: flex; align-items: center; gap: 6px; position: relative;
+  }
+  .editor-encoding-menu-item:hover { background: #094771; color: #fff; }
+  .editor-encoding-menu-item.checked::before {
+    content: '●'; position: absolute; left: 14px; color: #4ec9b0; font-size: 10px;
+  }
+  .editor-encoding-menu-item.checked { color: #4ec9b0; }
+  .editor-encoding-menu-divider { height: 1px; background: #454545; margin: 4px 0; }
   .editor-resize-handle {
     position: absolute; right: 0; bottom: 20px; width: 14px; height: 14px;
     cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, #555 50%); z-index: 2;
@@ -2024,7 +2070,6 @@ const CSS_STYLES = `
     .logo { font-size: 18px; white-space: nowrap; }
     .search-group { max-width: 100%; width: 100%; margin: 0; order: 3; }
     .header-actions { width: auto; gap: 4px; }
-    .header-actions .btn { padding: 6px 12px; font-size: 12px; }
     #adminBtn { display: none; }
 
     .sidebar {
@@ -2077,10 +2122,10 @@ const CSS_STYLES = `
 
     .modal { padding: 20px; width: 94%; max-width: 100%; border-radius: var(--radius-lg); }
     .modal-title { font-size: 16px; }
-    .modal-overlay { align-items: flex-end; }
+    .modal-overlay { align-items: flex-start; padding-top: 8vh; }
     .modal-overlay .modal {
-      border-radius: var(--radius-xl) var(--radius-xl) 0 0;
-      max-height: 90vh; margin-bottom: 0;
+      border-radius: 0 0 var(--radius-xl) var(--radius-xl);
+      max-height: 90vh; margin-top: 0;
     }
 
     .login-card, .share-card { padding: 28px 20px; max-width: 100%; margin: 0 8px; border-radius: var(--radius-lg); }
@@ -2100,6 +2145,7 @@ const CSS_STYLES = `
 
     .btn { min-height: 40px; }
     .btn-sm { min-height: 32px; padding: 4px 10px; font-size: 11px; }
+
     .modal-close { width: 36px; height: 36px; font-size: 24px; }
 
     .form-input, .form-select { padding: 10px 12px; font-size: 16px; }
@@ -2114,6 +2160,37 @@ const CSS_STYLES = `
       gap: 8px;
     }
     .mobile-upload-bar .btn { flex: 1; }
+    .mobile-upload-bar .new-file-dropdown-btn { flex: none; min-height: 0; padding: 4px 6px; min-width: 0; font-size: 14px; }
+
+    /* Editor mobile optimization */
+    .editor-window {
+      width: 100vw !important; height: 100vh !important;
+      min-width: 100vw !important; min-height: 100vh !important;
+      border-radius: 0; position: fixed !important; top: 0; left: 0;
+    }
+    .editor-modal-overlay { padding: 0; align-items: stretch !important; justify-content: stretch !important; }
+    .editor-toolbar {
+      padding: 4px 6px; gap: 2px; flex-wrap: wrap; cursor: default;
+    }
+    .editor-toolbar-spacer { display: none; }
+    .editor-tool-btn {
+      padding: 8px 10px; font-size: 15px; min-width: 36px; min-height: 36px;
+      -webkit-tap-highlight-color: transparent;
+    }
+    .editor-tool-btn:active { background: rgba(255,255,255,0.15); }
+    .editor-toolbar-sep { display: none; }
+    .editor-filename { font-size: 12px; min-width: 50px; max-width: 90px; flex-shrink: 0; }
+    .editor-fs-label { font-size: 12px; min-width: 16px; }
+    .editor-save-btn { font-size: 13px; white-space: nowrap; }
+    .editor-statusbar {
+      font-size: 10px; gap: 8px; padding: 2px 8px;
+      overflow-x: auto; -webkit-overflow-scrolling: touch;
+    }
+    .editor-statusbar span:nth-child(3) { display: none; }
+    .editor-resize-handle { display: none; }
+    #editorWindowBtn { display: none; }
+    .editor-encoding-menu { min-width: 180px; }
+    .editor-encoding-menu-item { padding: 10px 20px 10px 28px; font-size: 13px; }
   }
 
 </style>
@@ -2323,6 +2400,7 @@ const INDEX_PAGE = `
   <script src="https://cdn.jsdelivr.net/npm/mammoth@1.6.0/mammoth.browser.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/ace.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/ace-builds@1.32.9/src-min-noconflict/ext-modelist.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
 <body>
   <div class="header">
@@ -2365,9 +2443,14 @@ const INDEX_PAGE = `
     <div class="breadcrumb" id="breadcrumb" style="padding:4px 0;"></div>
 
     <div class="toolbar">
-      <button class="btn btn-primary" onclick="showNewFolderModal()">
-        📁 新建文件夹
-      </button>
+      <div class="new-file-dropdown">
+        <button class="btn btn-primary" onclick="showNewFolderModal()">📁 新建文件夹</button>
+        <button class="btn btn-primary new-file-dropdown-btn" onclick="event.stopPropagation();toggleDropdown(this)" title="新建文件">≡</button>
+        <div class="new-file-dropdown-menu">
+          <div class="new-file-dropdown-item" onclick="showNewFileModal('txt');closeDropdowns()"><span>📄</span> <span>TXT 文件</span></div>
+          <div class="new-file-dropdown-item" onclick="showNewFileModal('md');closeDropdowns()"><span>📝</span> <span>MD 文件</span></div>
+        </div>
+      </div>
       <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
         📤 上传文件
       </button>
@@ -2400,7 +2483,14 @@ const INDEX_PAGE = `
   <!-- Mobile Upload Bar -->
   <div class="mobile-upload-bar" id="mobileUploadBar">
     <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传</button>
-    <button class="btn btn-secondary" onclick="showNewFolderModal()">📁 新建文件夹</button>
+    <div class="new-file-dropdown">
+      <button class="btn btn-secondary" onclick="showNewFolderModal()">📁 新建文件夹</button>
+      <button class="btn btn-secondary new-file-dropdown-btn" onclick="event.stopPropagation();toggleDropdown(this)" title="新建文件">≡</button>
+      <div class="new-file-dropdown-menu">
+        <div class="new-file-dropdown-item" onclick="showNewFileModal('txt');closeDropdowns()"><span>📄</span> <span>TXT 文件</span></div>
+        <div class="new-file-dropdown-item" onclick="showNewFileModal('md');closeDropdowns()"><span>📝</span> <span>MD 文件</span></div>
+      </div>
+    </div>
   </div>
 
   <!-- New Folder Modal -->
@@ -2523,8 +2613,24 @@ const INDEX_PAGE = `
         <button class="editor-tool-btn" id="editorWordWrapBtn" onclick="editorToggleWordWrap()" title="切换自动换行">↩</button>
         <button class="editor-tool-btn" id="editorThemeBtn" onclick="editorToggleTheme()" title="切换主题">🌙</button>
         <button class="editor-tool-btn" id="editorWindowBtn" onclick="editorToggleFullscreen()" title="最大化/窗口">🗖</button>
+        <span class="editor-toolbar-sep"></span>
+        <button class="editor-tool-btn" id="editorEncodingBtn" onclick="toggleEncodingMenu(event)" title="编码">编码 ▾</button>
         <button class="editor-tool-btn editor-save-btn" id="editorSaveBtn" onclick="saveEditor()" title="保存 (Ctrl+S)">💾 保存</button>
         <button class="editor-tool-btn" onclick="closeEditor()" title="关闭 (Esc)">✕</button>
+        <!-- 编码下拉菜单 -->
+        <div class="editor-encoding-menu" id="editorEncodingMenu">
+          <div class="editor-encoding-menu-item" data-enc-use="ansi" onclick="openWithEncoding('ansi')">使用 ANSI/GBK 打开</div>
+          <div class="editor-encoding-menu-item checked" data-enc-use="utf-8" onclick="openWithEncoding('utf-8')">使用 UTF-8 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-8-bom" onclick="openWithEncoding('utf-8-bom')">使用 UTF-8-BOM 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-16le" onclick="openWithEncoding('utf-16le')">使用 UTF-16 LE 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-16be" onclick="openWithEncoding('utf-16be')">使用 UTF-16 BE 打开</div>
+          <div class="editor-encoding-menu-divider"></div>
+          <div class="editor-encoding-menu-item" data-enc-cv="ansi" onclick="convertEncoding('ansi')">转换为 ANSI/GBK</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-8" onclick="convertEncoding('utf-8')">转换为 UTF-8</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-8-bom" onclick="convertEncoding('utf-8-bom')">转换为 UTF-8-BOM</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-16le" onclick="convertEncoding('utf-16le')">转换为 UTF-16 LE</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-16be" onclick="convertEncoding('utf-16be')">转换为 UTF-16 BE</div>
+        </div>
       </div>
       <!-- 编辑器主体 -->
       <div id="aceEditorContainer" class="editor-body"></div>
@@ -2659,10 +2765,10 @@ const INDEX_PAGE = `
     }
 
     function clearSearch() {
+      closeSearch();
       const input = document.getElementById('searchInput');
       input.value = '';
       document.getElementById('searchClear').style.display = 'none';
-      document.getElementById('searchResults').classList.remove('active');
       document.getElementById('searchResults').innerHTML = '';
       input.focus();
     }
@@ -2695,6 +2801,7 @@ const INDEX_PAGE = `
 
     document.addEventListener('click', function(e) {
       if (!e.target.closest('.search-box')) closeSearch();
+      if (!e.target.closest('.new-file-dropdown')) closeDropdowns();
     });
 
     document.addEventListener('keydown', (e) => {
@@ -2943,12 +3050,15 @@ function showContextMenu(event, type, path, name, previewType) {
     \`;
   } else if (type === 'file') {
     
+    const canEdit = !previewType || previewType === 'text' || previewType === 'html';
+    const canPreview = !!previewType;
+    
     menuItems = \`
-      \${previewType === 'text' ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
+      \${canEdit ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
         <span>✏️</span> <span>编辑</span>
       </div>
       <div class="context-menu-divider"></div>\` : ''}
-      \${previewType ? \`<div class="context-menu-item" onclick="previewFile('\${path}', '\${previewType}', '\${name}'); hideContextMenu();">
+      \${canPreview ? \`<div class="context-menu-item" onclick="previewFile('\${path}', '\${previewType}', '\${name}'); hideContextMenu();">
         <span>👁️</span> <span>预览</span>
       </div>
       <div class="context-menu-divider"></div>\` : ''}
@@ -3031,8 +3141,11 @@ function initContextMenu() {
         <div class="context-menu-item" onclick="showNewFolderModal(); hideContextMenu();">
           <span>📁</span> <span>新建文件夹</span>
         </div>
-        <div class="context-menu-item" onclick="showNewFileModal(); hideContextMenu();">
-          <span>📄</span> <span>新建文件</span>
+        <div class="context-menu-item" onclick="showNewFileModal('txt'); hideContextMenu();">
+          <span>📄</span> <span>新建 TXT 文件</span>
+        </div>
+        <div class="context-menu-item" onclick="showNewFileModal('md'); hideContextMenu();">
+          <span>📝</span> <span>新建 MD 文件</span>
         </div>
         <div class="context-menu-divider"></div>
         <div class="context-menu-item" onclick="loadFiles(); hideContextMenu();">
@@ -3241,17 +3354,43 @@ async function downloadSelected() {
     return;
   }
 
+  const MAX_COUNT = 50, MAX_SIZE = 200 * 1024 * 1024; // 200MB
+  if (items.length > MAX_COUNT) {
+    showToast('最多同时下载 ' + MAX_COUNT + ' 个文件（当前 ' + items.length + ' 个）', 'warning');
+    return;
+  }
+  const totalSize = items.reduce((s, i) => s + (i.size || 0), 0);
+  if (totalSize > MAX_SIZE) {
+    showToast('总大小超过 200MB（' + formatFileSize(totalSize) + '），一次下载太多会撑爆浏览器', 'warning');
+    return;
+  }
+
   if (items.length === 1) {
     downloadFile(items[0].path);
     return;
   }
 
+  showToast('正在打包 ' + items.length + ' 个文件...', 'info');
+  const zip = new JSZip();
   for (const item of items) {
-    downloadFile(item.path);
-    await new Promise(resolve => setTimeout(resolve, 500)); 
+    try {
+      const resp = await fetch('/api/download' + item.path);
+      if (!resp.ok) throw new Error('download failed');
+      const blob = await resp.blob();
+      zip.file(item.name, blob);
+    } catch (e) {
+      showToast('下载失败: ' + item.name, 'error');
+      return;
+    }
   }
-
-  showToast('正在下载 ' + items.length + ' 个项目', 'info');
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+  const url = URL.createObjectURL(zipBlob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'files_' + new Date().toISOString().slice(0, 10) + '.zip';
+  a.click();
+  URL.revokeObjectURL(url);
+  showToast('打包下载完成', 'success');
 }
 
 function selectAll() {
@@ -3505,6 +3644,15 @@ sortedFiles.forEach(file => {
     }
 
     function handleFileClick(path, previewType, filename) {
+      if (filename && filename.slice(-4).toLowerCase() === '.url') {
+        const w = window.open('', '_blank');
+        fetch('/api/preview' + path).then(r => r.text()).then(text => {
+          const m = text.match(/^URL=(.+)$/im);
+          if (m && m[1].trim()) w.location = m[1].trim();
+          else { w.close(); alert('无法从 .url 文件中解析出网址'); }
+        }).catch(e => { w.close(); alert('打开链接失败: ' + e.message); });
+        return;
+      }
       if (previewType) {
         previewFile(path, previewType, filename);
       } else {
@@ -3521,9 +3669,10 @@ sortedFiles.forEach(file => {
         'mp4':'🎬', 'avi':'🎬', 'mkv':'🎬', 'mov':'🎬', 'webm':'🎬',
         'zip':'📦', 'rar':'📦', '7z':'📦', 'tar':'📦', 'gz':'📦',
         'js':'📜', 'ts':'📜', 'py':'📜', 'java':'📜', 'cpp':'📜', 'c':'📜',
-        'html':'🌐', 'css':'🎨', 'json':'📋', 'xml':'📋', 'yml':'📋', 'yaml':'📋', 'csv':'📊',
-        'txt':'📄', 'md':'📝',
+        'html':'🐋', 'css':'🎨', 'json':'📋', 'xml':'📋', 'yml':'📋', 'yaml':'📋', 'csv':'📊',
+        'txt':'📝', 'md':'📝', 'epub':'📓',
         'glb':'🧬', 'gltf':'🧬', 'obj':'🧬',
+        'exe':'🖥️', 'msi':'🖥️', 'apk':'📱', 'url':'🌐',
       };
       return icons[ext] || '📄';
     }
@@ -3782,6 +3931,10 @@ sortedFiles.forEach(file => {
             content.innerHTML = '<iframe class="preview-pdf" src="' + previewUrl + '"></iframe>';
             break;
 
+          case 'html':
+            content.innerHTML = '<iframe class="preview-html" src="' + previewUrl + '" sandbox="allow-scripts allow-same-origin allow-forms allow-popups"></iframe>';
+            break;
+
           case 'text':
             const textResponse = await fetch(previewUrl);
             const text = await textResponse.text();
@@ -3868,11 +4021,29 @@ sortedFiles.forEach(file => {
       }, '文件夹创建成功', loadFiles);
     }
 
-    function showNewFileModal() {
-      document.getElementById('newFileName').value = '';
+    function toggleDropdown(btn) {
+      const menu = btn.parentElement.querySelector('.new-file-dropdown-menu');
+      const rect = btn.getBoundingClientRect();
+      menu.classList.remove('dropup');
+      const willOpen = !menu.classList.contains('active');
+      menu.classList.toggle('active');
+      if (willOpen) {
+        const isMobile = window.innerWidth <= 768;
+        if (isMobile || rect.bottom > window.innerHeight / 2) {
+          menu.classList.add('dropup');
+        }
+      }
+    }
+    function closeDropdowns() {
+      document.querySelectorAll('.new-file-dropdown-menu.active').forEach(m => m.classList.remove('active'));
+    }
+
+    function showNewFileModal(ext) {
+      const name = ext ? '新建文件.' + ext : '';
+      document.getElementById('newFileName').value = name;
       document.getElementById('newFileContent').value = '';
       document.getElementById('newFileModal').classList.add('active');
-      setTimeout(() => document.getElementById('newFileName').focus(), 100);
+      setTimeout(() => { const inp = document.getElementById('newFileName'); inp.focus(); inp.select(); }, 100);
     }
 
     async function createNewFile(event) {
@@ -3970,6 +4141,8 @@ sortedFiles.forEach(file => {
     let editorDarkTheme = true;
     let editorWordWrap = true;
     let editorFullscreen = false;
+    let editorRawBytes = null;
+    let editorCurrentEncoding = 'utf-8';
 
     async function openEditor(filePath, filename) {
       try {
@@ -3980,7 +4153,12 @@ sortedFiles.forEach(file => {
           showToast(d.message || '无法读取文件', 'error');
           return;
         }
-        const content = await res.text();
+        const arrayBuffer = await res.arrayBuffer();
+        editorRawBytes = new Uint8Array(arrayBuffer);
+        editorCurrentEncoding = 'utf-8';
+        const content = decodeWithEncoding(editorRawBytes, editorCurrentEncoding);
+        updateEncodingMenuChecked(editorCurrentEncoding);
+        updateEncodingStatus(editorCurrentEncoding);
 
         document.getElementById('editorFilename').textContent = filename;
         editorCurrentPath = filePath;
@@ -3989,15 +4167,19 @@ sortedFiles.forEach(file => {
         const modal = document.getElementById('editorModal');
         const win = document.getElementById('editorWindow');
 
-        editorFullscreen = false;
-        document.getElementById('editorWindowBtn').textContent = '🗖';
-        win.style.width = '90vw';
-        win.style.height = '85vh';
-        win.style.position = 'relative';
-        win.style.left = '';
-        win.style.top = '';
-        modal.style.alignItems = 'center';
-        modal.style.justifyContent = 'center';
+        if (window.innerWidth <= 768) {
+          editorFullscreen = true;
+        } else {
+          editorFullscreen = false;
+          document.getElementById('editorWindowBtn').textContent = '🗖';
+          win.style.width = '90vw';
+          win.style.height = '85vh';
+          win.style.position = 'relative';
+          win.style.left = '';
+          win.style.top = '';
+          modal.style.alignItems = 'center';
+          modal.style.justifyContent = 'center';
+        }
 
         modal.classList.add('active');
 
@@ -4091,7 +4273,79 @@ sortedFiles.forEach(file => {
       }
       document.getElementById('editorModal').classList.remove('active');
       editorCurrentPath = null;
+      editorRawBytes = null;
+      editorCurrentEncoding = 'utf-8';
       setEditorDirty(false);
+    }
+
+    function decodeWithEncoding(bytes, encoding) {
+      try {
+        const decoder = new TextDecoder(encoding, { fatal: false });
+        return decoder.decode(bytes);
+      } catch (e) {
+        showToast('不支持的编码: ' + encoding, 'error');
+        return '';
+      }
+    }
+
+    function updateEncodingStatus(encoding) {
+      const displayMap = {
+        'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8 BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE',
+        'gbk': 'GBK', 'ansi': 'ANSI', 'windows-1252': 'ANSI'
+      };
+      document.getElementById('editorStatusEncoding').textContent = displayMap[encoding] || encoding.toUpperCase();
+    }
+
+    function updateEncodingMenuChecked(encoding) {
+      document.querySelectorAll('#editorEncodingMenu .editor-encoding-menu-item[data-enc-use]').forEach(item => {
+        item.classList.toggle('checked', item.dataset.encUse === encoding);
+      });
+    }
+
+    function toggleEncodingMenu(e) {
+      e.stopPropagation();
+      document.getElementById('editorEncodingMenu').classList.toggle('open');
+    }
+
+    function closeAllEncodingMenus() {
+      document.getElementById('editorEncodingMenu').classList.remove('open');
+    }
+
+    document.addEventListener('click', function(e) {
+      if (!e.target.closest('.editor-encoding-menu') && !e.target.closest('#editorEncodingBtn')) {
+        closeAllEncodingMenus();
+      }
+    });
+
+    function openWithEncoding(encoding) {
+      closeAllEncodingMenus();
+      if (!editorRawBytes || !aceEditor) return;
+      const encMap = { 'ansi': 'gbk', 'gbk': 'gbk', 'utf-8': 'utf-8', 'utf-8-bom': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16be': 'utf-16be' };
+      const enc = encMap[encoding] || encoding;
+      const content = decodeWithEncoding(editorRawBytes, enc);
+      editorCurrentEncoding = encoding;
+      aceEditor.session.setValue(content, -1);
+      aceEditor.session.getUndoManager().reset();
+      setEditorDirty(false);
+      updateEncodingMenuChecked(encoding);
+      updateEncodingStatus(encoding);
+      const labels = { 'ansi': 'ANSI/GBK', 'gbk': 'GBK', 'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8-BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE' };
+      showToast('已使用 ' + (labels[encoding] || encoding.toUpperCase()) + ' 编码打开', 'success');
+    }
+
+    function convertEncoding(encoding) {
+      closeAllEncodingMenus();
+      if (!editorRawBytes || !aceEditor) return;
+      const encMap = { 'ansi': 'gbk', 'gbk': 'gbk', 'utf-8': 'utf-8', 'utf-8-bom': 'utf-8', 'utf-16le': 'utf-16le', 'utf-16be': 'utf-16be' };
+      const enc = encMap[encoding] || encoding;
+      const content = decodeWithEncoding(editorRawBytes, enc);
+      editorCurrentEncoding = encoding;
+      aceEditor.session.setValue(content, -1);
+      aceEditor.session.getUndoManager().reset();
+      setEditorDirty(false);
+      updateEncodingStatus(encoding);
+      const labels = { 'ansi': 'ANSI/GBK', 'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8-BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE' };
+      showToast('已转换为 ' + (labels[encoding] || encoding.toUpperCase()) + ' 编码', 'success');
     }
 
     function editorUndo() { if (aceEditor) aceEditor.undo(); }
@@ -4224,6 +4478,48 @@ sortedFiles.forEach(file => {
       document.addEventListener('mouseup', function() {
         isDragging = false;
       });
+
+      // Touch support for dragging (tablet window mode)
+      document.addEventListener('touchstart', function(e) {
+        const toolbar = document.getElementById('editorToolbar');
+        if (!toolbar || !toolbar.contains(e.target)) return;
+        if (e.target.closest('.editor-tool-btn')) return;
+        if (editorFullscreen) return;
+        const win = document.getElementById('editorWindow');
+        if (!win || !win.style.left) {
+          const rect = win.getBoundingClientRect();
+          win.style.position = 'fixed';
+          win.style.left = rect.left + 'px';
+          win.style.top = rect.top + 'px';
+          win.style.width = rect.width + 'px';
+          win.style.height = rect.height + 'px';
+          document.getElementById('editorModal').style.alignItems = 'stretch';
+          document.getElementById('editorModal').style.justifyContent = 'stretch';
+        }
+        isDragging = true;
+        const touch = e.touches[0];
+        startX = touch.clientX;
+        startY = touch.clientY;
+        dragX = parseInt(win.style.left) || 0;
+        dragY = parseInt(win.style.top) || 0;
+        e.preventDefault();
+      }, { passive: false });
+
+      document.addEventListener('touchmove', function(e) {
+        if (!isDragging) return;
+        const win = document.getElementById('editorWindow');
+        if (!win) return;
+        const touch = e.touches[0];
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        win.style.left = (dragX + dx) + 'px';
+        win.style.top = (dragY + dy) + 'px';
+        e.preventDefault();
+      }, { passive: false });
+
+      document.addEventListener('touchend', function() {
+        isDragging = false;
+      });
     })();
 
     document.addEventListener('keydown', function(e) {
@@ -4244,6 +4540,13 @@ sortedFiles.forEach(file => {
         closeEditor();
       }
     });
+
+    // Handle virtual keyboard on mobile
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function() {
+        if (aceEditor) aceEditor.resize();
+      });
+    }
 
     ${SHARED_SCRIPTS}
 

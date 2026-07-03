@@ -1,5 +1,5 @@
 /**
- * name = "mycloud-single"
+ * name = "mycloud-single 0.03"
  * 单用户精简版 —— 仅管理员密码登录，全功能文件管理
  *
  * [[kv_namespaces]]
@@ -138,7 +138,8 @@ function getPreviewType(filename) {
   const ext = filename.split('.').pop().toLowerCase();
   if (['jpg','jpeg','png','gif','webp','svg','ico','bmp'].includes(ext)) return 'image';
   if (ext === 'pdf') return 'pdf';
-  if (['txt','md','json','js','ts','css','html','htm','xml','yaml','yml','ini','conf','cfg','sh','py','php','java','c','cpp','go','rs','rb','lua','sql','csv','log','bat','ps1','vue','tsx','jsx','toml','properties','pl','dart','tf','proto'].includes(ext)) return 'text';
+  if (['html','htm'].includes(ext)) return 'html';
+  if (['txt','md','json','js','ts','css','xml','yaml','yml','ini','conf','cfg','sh','py','php','java','c','cpp','go','rs','rb','lua','sql','csv','log','bat','ps1','vue','tsx','jsx','toml','properties','pl','dart','tf','proto'].includes(ext)) return 'text';
   if (ext === 'docx') return 'word';
   if (['mp4','webm','ogg'].includes(ext)) return 'video';
   if (['mp3','wav','flac','m4a'].includes(ext)) return 'audio';
@@ -555,6 +556,208 @@ async function handleEditFile(request, env, path) {
   return jsonResponse({ success: false, message: '不支持的请求方法' }, 405);
 }
 
+// ── ZIP 打包下载 ────────────────────────────────────────
+
+function crc32Table() {
+  const table = new Uint32Array(256);
+  for (let i = 0; i < 256; i++) {
+    let c = i;
+    for (let j = 0; j < 8; j++) {
+      c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    }
+    table[i] = c >>> 0;
+  }
+  return table;
+}
+const CRC32_TABLE = crc32Table();
+
+function crc32(data) {
+  let crc = 0xFFFFFFFF;
+  for (let i = 0; i < data.length; i++) {
+    crc = CRC32_TABLE[(crc ^ data[i]) & 0xFF] ^ (crc >>> 8);
+  }
+  return (crc ^ 0xFFFFFFFF) >>> 0;
+}
+
+// 递归收集 R2 中所有文件（含子文件夹），计算 ZIP 内相对路径
+async function collectR2Files(env, prefix, relativePrefix, allFiles) {
+  let cursor;
+  do {
+    const batch = await env.R2_BUCKET.list({ prefix: prefix + '/', cursor });
+    if (batch.objects) {
+      for (const obj of batch.objects) {
+        if (obj.key.endsWith('/.keep') || obj.key.endsWith('/.folder')) continue;
+        allFiles.push({
+          key: obj.key,
+          relativePath: relativePrefix + obj.key.slice(prefix.length + 1),
+          size: obj.size
+        });
+      }
+    }
+    cursor = batch.truncated ? batch.cursor : null;
+  } while (cursor);
+}
+
+// 手动生成 ZIP 文件（Stored 无压缩，纯 JS，无依赖）
+// files: [{ key, relativePath, size }]
+async function generateZip(files, env) {
+  const encoder = new TextEncoder();
+  const parts = [];          // 所有 Uint8Array 片段
+  let currentOffset = 0;     // 当前写偏移（用于中央目录）
+  const centralEntries = []; // { filename, crc, size, offset }
+
+  for (const file of files) {
+    const obj = await env.R2_BUCKET.get(file.key);
+    if (!obj) continue;
+
+    const data = new Uint8Array(await obj.arrayBuffer());
+    const crc = crc32(data);
+    const filenameBytes = encoder.encode(file.relativePath);
+    const headerLen = 30 + filenameBytes.length;
+
+    // ── Local file header ──
+    const header = new Uint8Array(headerLen);
+    const h = new DataView(header.buffer);
+    h.setUint32(0,  0x04034b50, true); // signature
+    h.setUint16(4,  20,        true); // version needed
+    h.setUint16(6,  0x0800,   true); // general flag (UTF-8)
+    h.setUint16(8,  0,         true); // compression method (stored)
+    h.setUint16(10, 0,         true); // last mod time
+    h.setUint16(12, 0,         true); // last mod date
+    h.setUint32(14, crc,       true);
+    h.setUint32(18, data.length, true); // compressed size
+    h.setUint32(22, data.length, true); // uncompressed size
+    h.setUint16(26, filenameBytes.length, true);
+    h.setUint16(28, 0, true); // extra field length
+    header.set(filenameBytes, 30);
+
+    parts.push(header);
+    parts.push(data);
+    centralEntries.push({ filenameBytes, crc, size: data.length, offset: currentOffset });
+    currentOffset += headerLen + data.length;
+  }
+
+  // ── Central directory ──
+  const cdParts = [];
+  let cdSize = 0;
+  for (const entry of centralEntries) {
+    const entryLen = 46 + entry.filenameBytes.length;
+    const buf = new Uint8Array(entryLen);
+    const v = new DataView(buf.buffer);
+    v.setUint32(0,  0x02014b50, true); // signature
+    v.setUint16(4,  20,        true); // version made by
+    v.setUint16(6,  20,        true); // version needed
+    v.setUint16(8,  0x0800,   true); // general flag (UTF-8)
+    v.setUint16(10, 0,         true); // compression method
+    v.setUint16(12, 0,         true); // last mod time
+    v.setUint16(14, 0,         true); // last mod date
+    v.setUint32(16, entry.crc,      true);
+    v.setUint32(20, entry.size,     true); // compressed
+    v.setUint32(24, entry.size,     true); // uncompressed
+    v.setUint16(28, entry.filenameBytes.length, true);
+    v.setUint16(30, 0, true); // extra
+    v.setUint16(32, 0, true); // comment
+    v.setUint16(34, 0, true); // disk
+    v.setUint16(36, 0, true); // internal attr
+    v.setUint32(38, 0, true); // external attr
+    v.setUint32(42, entry.offset,   true);
+    buf.set(entry.filenameBytes, 46);
+    cdParts.push(buf);
+    cdSize += entryLen;
+  }
+
+  // ── End of central directory ──
+  const eocd = new Uint8Array(22);
+  const e = new DataView(eocd.buffer);
+  e.setUint32(0,  0x06054b50, true);
+  e.setUint16(4,  0, true);
+  e.setUint16(6,  0, true);
+  e.setUint16(8,  centralEntries.length, true);
+  e.setUint16(10, centralEntries.length, true);
+  e.setUint32(12, cdSize,     true);
+  e.setUint32(16, currentOffset, true);
+  e.setUint16(20, 0, true);
+
+  // 拼接所有部分
+  const total = currentOffset + cdSize + 22;
+  const result = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { result.set(p, off); off += p.length; }
+  for (const p of cdParts) { result.set(p, off); off += p.length; }
+  result.set(eocd, off);
+  return result;
+}
+
+async function handleZipDownload(request, env) {
+  const auth = await requireAuth(request, env);
+  if (auth instanceof Response) return auth;
+
+  const MAX_COUNT = 50;
+  const MAX_SIZE = 200 * 1024 * 1024;
+
+  function checkLimits(files) {
+    if (files.length > MAX_COUNT) return '文件数量超过限制（最多 ' + MAX_COUNT + ' 个文件）';
+    const totalSize = files.reduce((s, f) => s + f.size, 0);
+    if (totalSize > MAX_SIZE) return '文件总大小超过限制（最多 ' + (MAX_SIZE / 1024 / 1024) + ' MB）';
+    return null;
+  }
+
+  try {
+    const { paths } = await request.json();
+    if (!Array.isArray(paths) || paths.length === 0) {
+      return jsonResponse({ success: false, message: '请提供要下载的路径' }, 400);
+    }
+
+    const allFiles = [];
+    for (const p of paths) {
+      const key = normalizePath(p);
+      const head = await env.R2_BUCKET.head(key);
+      if (head && !key.endsWith('/.keep') && !key.endsWith('/.folder')) {
+        allFiles.push({ key, relativePath: key.split('/').pop(), size: head.size });
+      } else {
+        const folderName = (key.endsWith('/') ? key.slice(0, -1) : key).split('/').pop();
+        await collectR2Files(env, key, folderName + '/', allFiles);
+      }
+      const err = checkLimits(allFiles);
+      if (err) return jsonResponse({ success: false, message: err }, 400);
+    }
+
+    if (allFiles.length === 0) {
+      return jsonResponse({ success: false, message: '没有可下载的文件' }, 404);
+    }
+
+    // 如果只有一个文件，直接下载（不走 ZIP）
+    if (allFiles.length === 1 && !allFiles[0].relativePath.endsWith('/')) {
+      const obj = await env.R2_BUCKET.get(allFiles[0].key);
+      if (obj) {
+        const filename = allFiles[0].relativePath;
+        return new Response(obj.body, {
+          headers: {
+            'Content-Type': obj.httpMetadata?.contentType || 'application/octet-stream',
+            'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+            'Content-Length': obj.size,
+          }
+        });
+      }
+    }
+
+    // 生成 ZIP
+    const zipData = await generateZip(allFiles, env);
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const filename = 'files_' + dateStr + '.zip';
+
+    return new Response(zipData, {
+      headers: {
+        'Content-Type': 'application/zip',
+        'Content-Disposition': `attachment; filename="${encodeURIComponent(filename)}"`,
+        'Content-Length': zipData.length,
+      }
+    });
+  } catch (e) {
+    return jsonResponse({ success: false, message: '打包失败: ' + e.message }, 500);
+  }
+}
+
 async function handleCheckAuth(request, env) {
   const auth = await verifyAuth(request, env);
   if (!auth) return jsonResponse({ authenticated: false });
@@ -851,12 +1054,9 @@ async function handleDavPut(request, env, davPath) {
     if (folderCheck.objects?.length > 0 || folderCheck.delimitedPrefixes?.length > 0) {
       return new Response('Target is a collection', { status: 405 });
     }
-    if (!overwrite) {
-      const existing = await env.R2_BUCKET.head(key);
-      if (existing) return new Response(null, { status: 412 });
-    }
     const contentType = request.headers.get('Content-Type') || getMimeType(key) || 'application/octet-stream';
     const existed = await env.R2_BUCKET.head(key);
+    if (!overwrite && existed) return new Response(null, { status: 412 });
     await env.R2_BUCKET.put(key, request.body, {
       httpMetadata: { contentType }
     });
@@ -870,7 +1070,7 @@ async function handleDavDelete(request, env, davPath) {
   if (!auth) return requireDavAuth(request, env);
 
   try {
-    const obj = await env.R2_BUCKET.get(davPath);
+    const obj = await env.R2_BUCKET.head(davPath);
     const list = await env.R2_BUCKET.list({ prefix: davPath + '/', delimiter: '/', limit: 1 });
     const exists = obj || (list.objects?.length > 0 || list.delimitedPrefixes?.length > 0);
     if (!exists) return new Response(null, { status: 404 });
@@ -886,7 +1086,7 @@ async function handleDavMkcol(request, env, davPath) {
 
   try {
     const key = davPath;
-    const existing = await env.R2_BUCKET.get(key);
+    const existing = await env.R2_BUCKET.head(key);
     if (existing) {
       return new Response(null, { status: 405, headers: { 'Allow': 'GET,OPTIONS,PROPFIND' } });
     }
@@ -992,12 +1192,14 @@ const CSS_STYLES = `
     --error: #ff3b30;
     --shadow-sm: 0 1px 3px rgba(0,0,0,0.06);
     --shadow: 0 2px 8px rgba(0,0,0,0.08);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.1);
     --shadow-lg: 0 8px 30px rgba(0,0,0,0.12);
     --radius-sm: 8px;
     --radius: 12px;
     --radius-lg: 16px;
     --radius-xl: 20px;
     --blur: saturate(180%) blur(20px);
+    --input-bg: #ffffff;
     --transition: 0.2s cubic-bezier(0.25, 0.1, 0.25, 1);
   }
   [data-theme="dark"] {
@@ -1006,6 +1208,7 @@ const CSS_STYLES = `
     --background: #000000;
     --surface: #1c1c1e;
     --surface-hover: #2c2c2e;
+    --input-bg: #2c2c2e;
     --border: rgba(255,255,255,0.1);
     --border-strong: rgba(255,255,255,0.16);
     --text: #f5f5f7;
@@ -1013,6 +1216,7 @@ const CSS_STYLES = `
     --text-placeholder: #636366;
     --shadow-sm: 0 1px 3px rgba(0,0,0,0.4);
     --shadow: 0 2px 8px rgba(0,0,0,0.5);
+    --shadow-md: 0 4px 16px rgba(0,0,0,0.55);
     --shadow-lg: 0 8px 30px rgba(0,0,0,0.6);
   }
   .theme-toggle {
@@ -1107,7 +1311,7 @@ const CSS_STYLES = `
   }
   .form-input, .form-select {
     width: 100%; padding: 10px 14px;
-    background: var(--surface); border: 1px solid var(--border);
+    background: var(--input-bg); border: 1px solid var(--border);
     border-radius: var(--radius-sm); color: var(--text); font-size: 14px;
     transition: all var(--transition); font-family: inherit;
   }
@@ -1237,6 +1441,32 @@ const CSS_STYLES = `
   .file-name {
     font-size: 12px; font-weight: 500; text-align: center;
     word-break: break-all; line-height: 1.3;
+    min-height: 18px;
+    /* 为内联重命名 input 留出空间 */
+  }
+  .file-item.renaming .file-name {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    width: 100%;
+    overflow: visible;
+  }
+  .inline-rename-input {
+    width: 90%;
+    min-width: 60px;
+    padding: 2px 6px;
+    border: 1px solid var(--primary);
+    border-radius: 4px;
+    font-size: 12px;
+    outline: none;
+    background: var(--input-bg);
+    color: var(--text);
+    text-align: center;
+    pointer-events: auto;
+  }
+  .inline-rename-input:focus {
+    border-color: var(--primary);
+    box-shadow: 0 0 0 2px rgba(0,122,255,0.18);
   }
   .file-meta {
     font-size: 11px; color: var(--text-muted); text-align: center;
@@ -1262,7 +1492,12 @@ const CSS_STYLES = `
   .file-list .file-item:hover { background: var(--surface-hover); transform: none; border-color: transparent; border-bottom-color: var(--border); box-shadow: none; }
   .file-list .file-item.selected { background: rgba(0,122,255,0.06); border-color: transparent; border-bottom-color: var(--primary); box-shadow: none; }
   .file-list .file-icon { font-size: 20px; margin: 0; }
-  .file-list .file-name { text-align: left; word-break: break-all; }
+  .file-list .file-name { text-align: left; word-break: break-all; overflow: visible; }
+  .file-list .file-item.renaming .file-name {
+    display: flex;
+    align-items: center;
+    overflow: visible;
+  }
   .file-list .file-meta { text-align: right; white-space: nowrap; font-size: 12px; }
   .file-list-header {
     display: grid; grid-template-columns: 36px 1fr 100px 80px 70px; align-items: center;
@@ -1274,6 +1509,25 @@ const CSS_STYLES = `
   .sortable-header:hover { color: var(--primary); }
   .sortable-header.active { color: var(--primary); }
   .toolbar { display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; align-items: center; }
+  .new-file-dropdown { position: relative; display: inline-flex; }
+  .new-file-dropdown .btn { border-radius: 0; margin-left: -1px; }
+  .new-file-dropdown .btn:first-child { border-radius: var(--radius) 0 0 var(--radius); }
+  .new-file-dropdown .btn:last-child { border-radius: 0 var(--radius) var(--radius) 0; }
+  .dropdown-toggle { padding: 6px 10px !important; min-width: 32px !important; }
+  .dropdown-menu {
+    position: absolute; top: 100%; left: 0; z-index: 100;
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--radius); box-shadow: var(--shadow-md);
+    min-width: 140px; padding: 4px 0; margin-top: 2px;
+    display: none; animation: fadeIn 0.15s ease;
+  }
+  .dropdown-menu.show { display: block; }
+  .dropdown-item {
+    padding: 8px 14px; cursor: pointer; transition: background var(--transition);
+    font-size: 13px; white-space: nowrap;
+  }
+  .dropdown-item:hover { background: var(--surface-hover); }
+  .file-item.renaming .file-icon { opacity: 0.5; }
   .selection-info {
     margin-left: auto; padding: 6px 14px; background: var(--primary);
     color: #fff; border-radius: 20px; font-size: 12px; font-weight: 500;
@@ -1330,6 +1584,7 @@ const CSS_STYLES = `
     color: #1d1d1f;
   }
   .preview-pdf { width: 100%; height: 100%; border: none; border-radius: var(--radius-sm); }
+  .preview-html { width: 100%; height: 100%; border: none; border-radius: var(--radius-sm); background: #fff; }
   .preview-video, .preview-audio { max-width: 100%; max-height: 100%; }
   .preview-markdown {
     width: 100%; max-width: 900px; height: 100%;
@@ -1474,7 +1729,7 @@ const CSS_STYLES = `
   .editor-toolbar {
     display: flex; align-items: center; gap: 4px; padding: 5px 10px;
     background: #2d2d2d; border-bottom: 1px solid #404040;
-    user-select: none; cursor: move; flex-shrink: 0;
+    user-select: none; cursor: move; flex-shrink: 0; position: relative;
   }
   .editor-toolbar-spacer { flex: 1; }
   .editor-toolbar-sep { width: 1px; background: #404040; height: 18px; margin: 0 4px; }
@@ -1491,6 +1746,24 @@ const CSS_STYLES = `
     color: #fff; font-size: 11px; font-family: 'SF Mono', monospace; flex-shrink: 0; user-select: none;
   }
   .editor-status-encoding { margin-left: auto; }
+  .editor-encoding-menu {
+    position: absolute; top: 100%; right: 10px; min-width: 200px;
+    background: #2d2d2d; border: 1px solid #454545; border-radius: 4px;
+    box-shadow: 0 6px 20px rgba(0,0,0,0.5); padding: 4px 0;
+    z-index: 10000; display: none;
+  }
+  .editor-encoding-menu.open { display: block; }
+  .editor-encoding-menu-item {
+    padding: 6px 24px 6px 32px; cursor: pointer; color: #ccc;
+    font-size: 12px; line-height: 1.4; white-space: nowrap;
+    display: flex; align-items: center; gap: 6px; position: relative;
+  }
+  .editor-encoding-menu-item:hover { background: #094771; color: #fff; }
+  .editor-encoding-menu-item.checked::before {
+    content: '●'; position: absolute; left: 14px; color: #4ec9b0; font-size: 10px;
+  }
+  .editor-encoding-menu-item.checked { color: #4ec9b0; }
+  .editor-encoding-menu-divider { height: 1px; background: #454545; margin: 4px 0; }
   .editor-resize-handle {
     position: absolute; right: 0; bottom: 20px; width: 14px; height: 14px;
     cursor: nwse-resize; background: linear-gradient(135deg, transparent 50%, #555 50%); z-index: 2;
@@ -1575,7 +1848,37 @@ const CSS_STYLES = `
       box-shadow: 0 -2px 10px rgba(0,0,0,0.06); z-index: 300;
       gap: 8px;
     }
-    .mobile-upload-bar .btn { flex: 1; }
+    .mobile-upload-bar > .btn { flex: 1; }
+    .mobile-upload-bar .new-file-dropdown { flex: 1; display: inline-flex; }
+    .mobile-upload-bar .new-file-dropdown .btn { flex: 1; }
+    .mobile-upload-bar .new-file-dropdown .dropdown-toggle { flex: 0; }
+    .mobile-upload-bar .dropdown-menu { bottom: 100%; top: auto; margin-bottom: 2px; }
+
+    .editor-window {
+      width: 100vw !important; height: 100vh !important;
+      max-width: 100vw; max-height: 100vh;
+      border-radius: 0; position: fixed !important;
+      top: 0 !important; left: 0 !important;
+      min-width: 100vw; min-height: 100vh;
+    }
+    .editor-modal-overlay { padding: 0; }
+    .editor-toolbar {
+      flex-wrap: wrap; gap: 2px; padding: 6px 8px; cursor: default;
+    }
+    .editor-tool-btn {
+      min-width: 36px; min-height: 36px; padding: 8px 10px;
+      font-size: 15px; -webkit-tap-highlight-color: transparent;
+    }
+    .editor-toolbar-sep { display: none; }
+    .editor-statusbar {
+      font-size: 11px; padding: 4px 8px; gap: 8px;
+      overflow-x: auto; -webkit-overflow-scrolling: touch;
+    }
+    .editor-statusbar span:nth-child(3) { display: none; }
+    .editor-resize-handle { display: none; }
+    #editorWindowBtn { display: none; }
+    .editor-encoding-menu { min-width: 180px; }
+    .editor-encoding-menu-item { padding: 10px 20px 10px 28px; font-size: 13px; min-height: 36px; }
   }
 
 </style>`;
@@ -1741,9 +2044,20 @@ const INDEX_PAGE = `
     <div class="breadcrumb" id="breadcrumb" style="padding:4px 0;"></div>
 
     <div class="toolbar">
-      <button class="btn btn-primary" onclick="showNewFolderModal()">
-        📁 新建文件夹
-      </button>
+      <div class="new-file-dropdown">
+        <button class="btn btn-primary" onclick="quickCreateFolder()">
+          📁 新建文件夹
+        </button>
+        <button class="btn btn-primary dropdown-toggle" onclick="toggleNewFileDropdown(event)">≡</button>
+        <div class="dropdown-menu">
+      <div class="dropdown-item" onclick="quickCreateFile('txt')">
+        📄 TXT 文件
+      </div>
+      <div class="dropdown-item" onclick="quickCreateFile('md')">
+        📝 MD 文件
+      </div>
+        </div>
+      </div>
       <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">
         📤 上传文件
       </button>
@@ -1776,7 +2090,18 @@ const INDEX_PAGE = `
   <!-- Mobile Upload Bar -->
   <div class="mobile-upload-bar" id="mobileUploadBar">
     <button class="btn btn-primary" onclick="document.getElementById('fileInput').click()">📤 上传</button>
-    <button class="btn btn-secondary" onclick="showNewFolderModal()">📁 新建文件夹</button>
+    <div class="new-file-dropdown">
+      <button class="btn btn-secondary" onclick="quickCreateFolder()">📁 新建</button>
+      <button class="btn btn-secondary dropdown-toggle" onclick="toggleNewFileDropdown(event)">≡</button>
+      <div class="dropdown-menu">
+        <div class="dropdown-item" onclick="quickCreateFile('txt')">
+          📄 TXT 文件
+        </div>
+        <div class="dropdown-item" onclick="quickCreateFile('md')">
+          📝 MD 文件
+        </div>
+      </div>
+    </div>
   </div>
 
   <!-- New Folder Modal -->
@@ -1857,8 +2182,23 @@ const INDEX_PAGE = `
         <button class="editor-tool-btn" id="editorWordWrapBtn" onclick="editorToggleWordWrap()" title="切换自动换行">↩</button>
         <button class="editor-tool-btn" id="editorThemeBtn" onclick="editorToggleTheme()" title="切换主题">🌙</button>
         <button class="editor-tool-btn" id="editorWindowBtn" onclick="editorToggleFullscreen()" title="最大化/窗口">🗖</button>
+        <button class="editor-tool-btn" id="editorEncodingBtn" onclick="toggleEncodingMenu(event)" title="编码">编码 ▾</button>
         <button class="editor-tool-btn editor-save-btn" id="editorSaveBtn" onclick="saveEditor()" title="保存 (Ctrl+S)">💾 保存</button>
         <button class="editor-tool-btn" onclick="closeEditor()" title="关闭 (Esc)">✕</button>
+        <!-- 编码下拉菜单 -->
+        <div class="editor-encoding-menu" id="editorEncodingMenu">
+          <div class="editor-encoding-menu-item" data-enc-use="ansi" onclick="openWithEncoding('ansi')">使用 ANSI/GBK 打开</div>
+          <div class="editor-encoding-menu-item checked" data-enc-use="utf-8" onclick="openWithEncoding('utf-8')">使用 UTF-8 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-8-bom" onclick="openWithEncoding('utf-8-bom')">使用 UTF-8-BOM 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-16le" onclick="openWithEncoding('utf-16le')">使用 UTF-16 LE 打开</div>
+          <div class="editor-encoding-menu-item" data-enc-use="utf-16be" onclick="openWithEncoding('utf-16be')">使用 UTF-16 BE 打开</div>
+          <div class="editor-encoding-menu-divider"></div>
+          <div class="editor-encoding-menu-item" data-enc-cv="ansi" onclick="convertEncoding('ansi')">转换为 ANSI/GBK</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-8" onclick="convertEncoding('utf-8')">转换为 UTF-8</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-8-bom" onclick="convertEncoding('utf-8-bom')">转换为 UTF-8-BOM</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-16le" onclick="convertEncoding('utf-16le')">转换为 UTF-16 LE</div>
+          <div class="editor-encoding-menu-item" data-enc-cv="utf-16be" onclick="convertEncoding('utf-16be')">转换为 UTF-16 BE</div>
+        </div>
       </div>
       <!-- 编辑器主体 -->
       <div id="aceEditorContainer" class="editor-body"></div>
@@ -1927,6 +2267,34 @@ const INDEX_PAGE = `
 
     let searchTimer = null;
     let pendingSelectFile = null;
+    let pendingRenamePath = null;
+
+    function getUniqueName(baseName, existingNames, ext) {
+      // ext: 文件扩展名（不含点），文件夹传 undefined
+      // 返回去重后的名称
+      if (ext) {
+        // 文件：检查 "baseName.ext", "baseName (1).ext", ...
+        const base = baseName;
+        let candidate = base + '.' + ext;
+        if (!existingNames.includes(candidate)) return candidate;
+        let i = 1;
+        while (true) {
+          candidate = base + ' (' + i + ').' + ext;
+          if (!existingNames.includes(candidate)) return candidate;
+          i++;
+        }
+      } else {
+        // 文件夹：检查 "baseName", "baseName (1)", ...
+        let candidate = baseName;
+        if (!existingNames.includes(candidate)) return candidate;
+        let i = 1;
+        while (true) {
+          candidate = baseName + ' (' + i + ')';
+          if (!existingNames.includes(candidate)) return candidate;
+          i++;
+        }
+      }
+    }
 
     function handleSearch(event) {
       clearTimeout(searchTimer);
@@ -2000,17 +2368,47 @@ const INDEX_PAGE = `
       input.focus();
     }
 
+    function getPreviewTypeFE(name) {
+      const ext = name.split('.').pop().toLowerCase();
+      if (ext === 'url') return 'url';
+      if (['html','htm'].includes(ext)) return 'html';
+      if (['jpg','jpeg','png','gif','webp','svg','bmp','ico'].includes(ext)) return 'image';
+      if (ext === 'pdf') return 'pdf';
+      if (['mp4','mov','avi','mkv','webm','ogg'].includes(ext)) return 'video';
+      if (['mp3','wav','flac','aac','m4a'].includes(ext)) return 'audio';
+      if (['doc','docx'].includes(ext)) return 'word';
+      if (['txt','md','json','js','ts','css','xml','yaml','yml','ini','conf','cfg','sh','py','php','java','c','cpp','go','rs','rb','lua','sql','csv','log','bat','ps1','vue','tsx','jsx','toml','properties','pl','dart','tf','proto'].includes(ext)) return 'text';
+      return null;
+    }
+
     function navigateToFolderOrDownload(path, name) {
       const isFolder = name.endsWith('/') || path.endsWith('/');
       if (isFolder) { navigateTo(path); return; }
-      const ext = name.split('.').pop().toLowerCase();
-      let pt = 'text';
-      if (/^(jpg|jpeg|png|gif|webp|svg|bmp|ico)$/.test(ext)) pt = 'image';
-      else if (ext === 'pdf') pt = 'pdf';
-      else if (/^(mp4|mov|avi|mkv|webm)$/.test(ext)) pt = 'video';
-      else if (/^(mp3|wav|flac|aac|ogg|m4a)$/.test(ext)) pt = 'audio';
-      else if (/^(doc|docx)$/.test(ext)) pt = 'word';
-      previewFile(path, pt, name);
+      const pt = getPreviewTypeFE(name);
+      if (pt === 'url') { openUrlFile(path); return; }
+      if (pt) { previewFile(path, pt, name); return; }
+      downloadFile(path);
+    }
+
+    async function openUrlFile(path) {
+      // 先同步打开空白窗口，绕过浏览器弹窗拦截器
+      const win = window.open('about:blank', '_blank');
+      if (!win) { showToast('弹窗被浏览器拦截，请允许本站弹窗', 'error'); return; }
+      try {
+        const res = await fetch('/api/preview' + path);
+        if (!res.ok) { win.close(); showToast('读取 .url 文件失败', 'error'); return; }
+        const text = await res.text();
+        const match = text.match(/^URL\s*=\s*(.+)$/m);
+        if (match && match[1]) {
+          let url = match[1].trim().replace(/\0/g, '').replace(/[\\r\\n]/g, '');
+          if (url) { win.location.href = url; return; }
+        }
+        win.close();
+        showToast('未找到有效的 URL 链接', 'error');
+      } catch (e) {
+        win.close();
+        showToast('打开 .url 文件失败: ' + e.message, 'error');
+      }
     }
 
     function navigateToFolderAndSelect(path, name) {
@@ -2277,7 +2675,7 @@ function showContextMenu(event, type, path, name, previewType) {
   } else if (type === 'file') {
     
     menuItems = \`
-      \${previewType === 'text' ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
+      \${!previewType || previewType === 'text' || previewType === 'html' ? \`<div class="context-menu-item" onclick="openEditor('\${path}', '\${name}'); hideContextMenu();">
         <span>✏️</span> <span>编辑</span>
       </div>
       <div class="context-menu-divider"></div>\` : ''}
@@ -2487,12 +2885,7 @@ function handleItemClick(event, element) {
     if (type === 'folder') {
       navigateTo(path);
     } else {
-      const pt = element.dataset.previewType;
-      if (pt) {
-        previewFile(path, pt, element.dataset.name);
-      } else {
-        downloadFile(path);
-      }
+      handleFileClick(path, element.dataset.previewType, element.dataset.name);
     }
   } else {
     
@@ -2501,13 +2894,13 @@ function handleItemClick(event, element) {
 }
 
 function getSelectedItems() {
+  const allItems = document.querySelectorAll('.file-item');
   const items = [];
   selectedItems.forEach(key => {
     const parts = key.split(':');
     const type = parts[0];
     const path = parts.slice(1).join(':');
-    const selector = '.file-item[data-path="' + path + '"]';
-    const element = document.querySelector(selector);
+    const element = Array.from(allItems).find(el => el.dataset.path === path && el.dataset.type === type);
     if (element) {
       items.push({
         type: type,
@@ -2571,17 +2964,47 @@ async function downloadSelected() {
     return;
   }
 
-  if (items.length === 1) {
+  // 单文件：直接下载（保持原有行为）
+  if (items.length === 1 && items[0].type === 'file') {
     downloadFile(items[0].path);
     return;
   }
 
-  for (const item of items) {
-    downloadFile(item.path);
-    await new Promise(resolve => setTimeout(resolve, 500)); 
-  }
+  showToast('正在请求服务端打包...', 'info');
 
-  showToast('正在下载 ' + items.length + ' 个项目', 'info');
+  try {
+    const paths = items.map(item => item.path);
+    const res = await fetch('/api/zip', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths })
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.message || '打包请求失败');
+    }
+
+    const blob = await res.blob();
+    const dateStr = new Date().toISOString().slice(0, 10);
+    const filename = 'files_' + dateStr + '.zip';
+
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = filename;
+    a.style.display = 'none';
+    document.body.appendChild(a);
+    a.click();
+    setTimeout(() => {
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    }, 1000);
+
+    showToast('已开始下载: ' + filename, 'success');
+  } catch (e) {
+    showToast('打包失败: ' + e.message, 'error');
+  }
 }
 
 function selectAll() {
@@ -2762,8 +3185,12 @@ sortedFiles.forEach(file => {
 
       fileList.innerHTML = html;
 
+      if (pendingRenamePath) {
+        setTimeout(() => startInlineRename(pendingRenamePath), 100);
+      }
+
       if (pendingSelectFile) {
-        const target = document.querySelector('.file-item[data-name="' + pendingSelectFile.replace(/"/g, '\\"') + '"]');
+        const target = Array.from(document.querySelectorAll('.file-item')).find(el => el.dataset.name === pendingSelectFile);
         if (target) {
           selectedItems.clear();
           document.querySelectorAll('.file-item.selected').forEach(el => el.classList.remove('selected'));
@@ -2782,6 +3209,7 @@ sortedFiles.forEach(file => {
     }
 
     function handleFileClick(path, previewType, filename) {
+      if (filename.endsWith('.url')) { openUrlFile(path); return; }
       if (previewType) {
         previewFile(path, previewType, filename);
       } else {
@@ -2798,9 +3226,10 @@ sortedFiles.forEach(file => {
         'mp4':'🎬', 'avi':'🎬', 'mkv':'🎬', 'mov':'🎬', 'webm':'🎬',
         'zip':'📦', 'rar':'📦', '7z':'📦', 'tar':'📦', 'gz':'📦',
         'js':'📜', 'ts':'📜', 'py':'📜', 'java':'📜', 'cpp':'📜', 'c':'📜',
-        'html':'🌐', 'css':'🎨', 'json':'📋', 'xml':'📋', 'yml':'📋', 'yaml':'📋', 'csv':'📊',
-        'txt':'📄', 'md':'📝',
+        'html':'🐋', 'css':'🎨', 'json':'📋', 'xml':'📋', 'yml':'📋', 'yaml':'📋', 'csv':'📊',
+        'txt':'📝', 'md':'📝', 'epub':'📓',
         'glb':'🧬', 'gltf':'🧬', 'obj':'🧬',
+        'exe':'🖥️', 'msi':'🖥️', 'apk':'📱', 'url':'🌐',
       };
       return icons[ext] || '📄';
     }
@@ -2948,19 +3377,24 @@ sortedFiles.forEach(file => {
         if (files[i].size <= SMALL) smallFiles.push(files[i]);
         else largeFiles.push(files[i]);
       }
-      async function uploadLarge(file) {
-        progressFilename.textContent = file.name + ' (' + (successCount + failCount + 1) + '/' + totalFiles + ')';
+
+      function uploadSingleFile(file, withProgress) {
+        if (withProgress) {
+          progressFilename.textContent = file.name + ' (' + (successCount + failCount + 1) + '/' + totalFiles + ')';
+        }
         return new Promise((resolve) => {
           const xhr = new XMLHttpRequest();
-          xhr.upload.addEventListener('progress', (e) => {
-            if (e.lengthComputable) {
-              const base = successCount + failCount;
-              const overall = (base + e.loaded / e.total) / totalFiles * 100;
-              const pct = Math.min(100, Math.floor(overall));
-              progressFill.style.width = pct + '%';
-              progressPercentage.textContent = pct + '%';
-            }
-          });
+          if (withProgress) {
+            xhr.upload.addEventListener('progress', (e) => {
+              if (e.lengthComputable) {
+                const base = successCount + failCount;
+                const overall = (base + e.loaded / e.total) / totalFiles * 100;
+                const pct = Math.min(100, Math.floor(overall));
+                progressFill.style.width = pct + '%';
+                progressPercentage.textContent = pct + '%';
+              }
+            });
+          }
           xhr.addEventListener('load', () => {
             try { const d = JSON.parse(xhr.responseText); if (d.success) successCount++; else failCount++; }
             catch(e) { failCount++; }
@@ -2977,30 +3411,13 @@ sortedFiles.forEach(file => {
           xhr.send(fd);
         });
       }
+
       if (smallFiles.length > 0) {
         progressFilename.textContent = '上传小文件...（' + smallFiles.length + ' 个）';
-        await Promise.all(smallFiles.map(file => {
-          return new Promise((resolve) => {
-            const xhr = new XMLHttpRequest();
-            xhr.addEventListener('load', () => {
-              try { const d = JSON.parse(xhr.responseText); if (d.success) successCount++; else failCount++; }
-              catch(e) { failCount++; }
-              const done = successCount + failCount;
-              const pct = Math.min(100, Math.floor(done / totalFiles * 100));
-              progressFill.style.width = pct + '%';
-              progressPercentage.textContent = pct + '%';
-              resolve();
-            });
-            xhr.addEventListener('error', () => { failCount++; resolve(); });
-            xhr.open('POST', '/api/files' + currentPath);
-            const fd = new FormData();
-            fd.append('file', file);
-            xhr.send(fd);
-          });
-        }));
+        await Promise.all(smallFiles.map(f => uploadSingleFile(f, false)));
       }
       for (let i = 0; i < largeFiles.length; i++) {
-        await uploadLarge(largeFiles[i]);
+        await uploadSingleFile(largeFiles[i], true);
       }
 
       progressFill.style.width = '100%';
@@ -3072,6 +3489,10 @@ sortedFiles.forEach(file => {
             }
             break;
 
+          case 'html':
+            content.innerHTML = '<iframe class="preview-html" src="' + previewUrl + '"></iframe>';
+            break;
+
           case 'video':
             content.innerHTML = '<video class="preview-video" controls autoplay><source src="' + previewUrl + '"></video>';
             break;
@@ -3122,6 +3543,29 @@ sortedFiles.forEach(file => {
       document.getElementById('newFolderModal').classList.add('active');
     }
 
+    function toggleNewFileDropdown(e) {
+      e.stopPropagation();
+      const btn = e.currentTarget || e.target;
+      const container = btn.closest('.new-file-dropdown');
+      const menu = container.querySelector('.dropdown-menu');
+      const isOpen = menu.classList.contains('show');
+      // 关闭所有下拉菜单
+      document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+      if (!isOpen) {
+        menu.classList.add('show');
+      }
+    }
+
+    // 点击页面任何地方关闭所有下拉菜单（已绑定一次）
+    if (!window.__dropdownGlobalCloseBound) {
+      window.__dropdownGlobalCloseBound = true;
+      document.addEventListener('click', (e) => {
+        if (!e.target.closest('.new-file-dropdown')) {
+          document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+        }
+      });
+    }
+
     async function createFolder(event) {
       event.preventDefault();
       const name = document.getElementById('folderName').value.trim();
@@ -3136,10 +3580,15 @@ sortedFiles.forEach(file => {
       }, '文件夹创建成功', loadFiles);
     }
 
-    function showNewFileModal() {
+    function showNewFileModal(ext) {
+      // 关闭所有下拉菜单
+      document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
       document.getElementById('newFileName').value = '';
       document.getElementById('newFileContent').value = '';
       document.getElementById('newFileModal').classList.add('active');
+      if (ext) {
+        document.getElementById('newFileName').value = '新建文件.' + ext;
+      }
       setTimeout(() => document.getElementById('newFileName').focus(), 100);
     }
 
@@ -3156,6 +3605,123 @@ sortedFiles.forEach(file => {
         method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ path, content })
       }, '文件创建成功', loadFiles);
+    }
+
+    async function quickCreateFolder() {
+      // 关闭所有下拉菜单
+      document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+      // 收集当前文件夹名称
+      const existingNames = [...document.querySelectorAll('.file-item[data-type="folder"] .file-name')]
+        .map(el => el.textContent.trim());
+      const name = getUniqueName('新建文件夹', existingNames);
+      let path = currentPath;
+      if (!path.endsWith('/')) path += '/';
+      path += name;
+      pendingRenamePath = path;
+      await apiCall('/api/folders', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path })
+      }, '文件夹创建成功', loadFiles);
+    }
+
+    async function quickCreateFile(ext) {
+      // 关闭所有下拉菜单
+      document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+      // 收集当前文件名称
+      const existingNames = [...document.querySelectorAll('.file-item[data-type="file"] .file-name')]
+        .map(el => el.textContent.trim());
+      const name = getUniqueName('新建文件', existingNames, ext);
+      let path = currentPath;
+      if (!path.endsWith('/')) path += '/';
+      path += name;
+      pendingRenamePath = path;
+      await apiCall('/api/files', {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ path, content: '' })
+      }, '文件创建成功', loadFiles);
+    }
+
+    function startInlineRename(path) {
+      // 用 encodeURIComponent 来安全匹配 data-path
+      const items = document.querySelectorAll('.file-item');
+      let item = null;
+      for (const el of items) {
+        if (el.dataset.path === path) { item = el; break; }
+      }
+      if (!item) { pendingRenamePath = null; return; }
+      const nameEl = item.querySelector('.file-name');
+      if (!nameEl) { pendingRenamePath = null; return; }
+      const oldName = nameEl.textContent;
+      const type = item.dataset.type;
+      // 替换文件名为 input
+      const input = document.createElement('input');
+      input.className = 'inline-rename-input';
+      input.value = oldName;
+      input.addEventListener('click', (e) => e.stopPropagation());
+      input.addEventListener('mousedown', (e) => e.stopPropagation());
+      // 选中文件名（文件去掉扩展名）
+      const dotIdx = type === 'file' ? oldName.lastIndexOf('.') : -1;
+      requestAnimationFrame(() => {
+        input.focus();
+        if (dotIdx > 0) {
+          input.setSelectionRange(0, dotIdx);
+        } else {
+          input.select();
+        }
+      });
+      nameEl.innerHTML = '';
+      nameEl.appendChild(input);
+      item.classList.add('renaming');
+
+      const save = async () => {
+        const newName = input.value.trim();
+        if (!newName || newName === oldName) {
+          cancelInlineRename(nameEl, oldName);
+          return;
+        }
+        // 计算新路径
+        const lastSlash = path.lastIndexOf('/');
+        const parent = lastSlash >= 0 ? path.substring(0, lastSlash + 1) : '/';
+        const newPath = parent + newName;
+        try {
+          const resp = await fetch('/api/files' + path, {
+            method: 'PUT', headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ newName })
+          });
+          const data = await resp.json();
+          if (data.success) {
+            showToast('重命名成功', 'success');
+            loadFiles();
+          } else {
+            showToast('重命名失败: ' + (data.message || '未知错误'), 'error');
+            cancelInlineRename(nameEl, oldName);
+          }
+        } catch (e) {
+          showToast('重命名失败: ' + e.message, 'error');
+          cancelInlineRename(nameEl, oldName);
+        }
+      };
+
+      const onBlur = () => {
+        // 延迟一点，让 Enter 的 handler 先触发
+        setTimeout(() => {
+          if (document.body.contains(input)) save();
+        }, 200);
+      };
+
+      input.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); save(); }
+        if (e.key === 'Escape') { e.preventDefault(); cancelInlineRename(nameEl, oldName); }
+      });
+      input.addEventListener('blur', onBlur);
+      pendingRenamePath = null;
+    }
+
+    function cancelInlineRename(nameEl, oldName) {
+      nameEl.textContent = oldName;
+      const item = nameEl.closest('.file-item');
+      if (item) item.classList.remove('renaming');
+      pendingRenamePath = null;
     }
 
     function showRenameModal(path, currentName) {
@@ -3192,6 +3758,8 @@ sortedFiles.forEach(file => {
     let editorDarkTheme = true;
     let editorWordWrap = true;
     let editorFullscreen = false;
+    let editorRawBytes = null;
+    let editorCurrentEncoding = 'utf-8';
 
     async function openEditor(filePath, filename) {
       try {
@@ -3202,7 +3770,10 @@ sortedFiles.forEach(file => {
           showToast(d.message || '无法读取文件', 'error');
           return;
         }
-        const content = await res.text();
+        const arrayBuffer = await res.arrayBuffer();
+        editorRawBytes = new Uint8Array(arrayBuffer);
+        editorCurrentEncoding = 'utf-8';
+        const content = decodeWithEncoding(editorRawBytes, editorCurrentEncoding);
 
         document.getElementById('editorFilename').textContent = filename;
         editorCurrentPath = filePath;
@@ -3211,15 +3782,27 @@ sortedFiles.forEach(file => {
         const modal = document.getElementById('editorModal');
         const win = document.getElementById('editorWindow');
 
-        editorFullscreen = false;
-        document.getElementById('editorWindowBtn').textContent = '🗖';
-        win.style.width = '90vw';
-        win.style.height = '85vh';
-        win.style.position = 'relative';
-        win.style.left = '';
-        win.style.top = '';
-        modal.style.alignItems = 'center';
-        modal.style.justifyContent = 'center';
+        const isMobile = window.innerWidth <= 768;
+        editorFullscreen = isMobile;
+        document.getElementById('editorWindowBtn').textContent = isMobile ? '🗗' : '🗖';
+        if (isMobile) {
+          win.style.width = '100vw';
+          win.style.height = '100vh';
+          win.style.position = 'fixed';
+          win.style.left = '0';
+          win.style.top = '0';
+          win.style.borderRadius = '0';
+          modal.style.alignItems = 'stretch';
+          modal.style.justifyContent = 'stretch';
+        } else {
+          win.style.width = '90vw';
+          win.style.height = '85vh';
+          win.style.position = 'relative';
+          win.style.left = '';
+          win.style.top = '';
+          modal.style.alignItems = 'center';
+          modal.style.justifyContent = 'center';
+        }
 
         modal.classList.add('active');
 
@@ -3264,6 +3847,8 @@ sortedFiles.forEach(file => {
         
         aceEditor.session.getUndoManager().reset();
         setEditorDirty(false);
+        updateEncodingMenuChecked(editorCurrentEncoding);
+        updateEncodingStatus(editorCurrentEncoding);
         aceEditor.focus();
         aceEditor.gotoLine(0, 0);
         updateEditorStatus();
@@ -3314,6 +3899,73 @@ sortedFiles.forEach(file => {
       document.getElementById('editorModal').classList.remove('active');
       editorCurrentPath = null;
       setEditorDirty(false);
+    }
+
+    function decodeWithEncoding(bytes, encoding) {
+      try {
+        let enc = encoding;
+        if (encoding === 'ansi') enc = 'gbk';
+        if (encoding === 'utf-8-bom') enc = 'utf-8';
+        const decoder = new TextDecoder(enc, { fatal: false });
+        return decoder.decode(bytes);
+      } catch (e) {
+        return new TextDecoder('utf-8').decode(bytes);
+      }
+    }
+
+    function toggleEncodingMenu(e) {
+      e.stopPropagation();
+      document.getElementById('editorEncodingMenu').classList.toggle('open');
+    }
+
+    function closeEncodingMenu() {
+      document.getElementById('editorEncodingMenu').classList.remove('open');
+    }
+
+    document.addEventListener('click', function(e) {
+      if (!e.target.closest('.editor-encoding-menu') && !e.target.closest('#editorEncodingBtn')) {
+        closeEncodingMenu();
+      }
+    });
+
+    function updateEncodingMenuChecked(encoding) {
+      const encMap = { 'gbk': 'ansi' };
+      const enc = encMap[encoding] || encoding;
+      document.querySelectorAll('#editorEncodingMenu .editor-encoding-menu-item[data-enc-use]').forEach(item => {
+        item.classList.toggle('checked', item.dataset.encUse === enc);
+      });
+    }
+
+    function updateEncodingStatus(encoding) {
+      const displayMap = { 'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8-BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE', 'gbk': 'GBK', 'ansi': 'ANSI' };
+      document.getElementById('editorStatusEncoding').textContent = displayMap[encoding] || encoding.toUpperCase();
+    }
+
+    function openWithEncoding(encoding) {
+      closeEncodingMenu();
+      if (!editorRawBytes || !aceEditor) return;
+      const content = decodeWithEncoding(editorRawBytes, encoding);
+      editorCurrentEncoding = encoding;
+      aceEditor.session.setValue(content, -1);
+      aceEditor.session.getUndoManager().reset();
+      setEditorDirty(false);
+      updateEncodingMenuChecked(encoding);
+      updateEncodingStatus(encoding);
+      const labels = { 'ansi': 'ANSI/GBK', 'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8-BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE' };
+      showToast('已使用 ' + (labels[encoding] || encoding.toUpperCase()) + ' 编码打开', 'success');
+    }
+
+    function convertEncoding(encoding) {
+      closeEncodingMenu();
+      if (!editorRawBytes || !aceEditor) return;
+      const content = decodeWithEncoding(editorRawBytes, encoding);
+      editorCurrentEncoding = encoding;
+      aceEditor.session.setValue(content, -1);
+      aceEditor.session.getUndoManager().reset();
+      setEditorDirty(false);
+      updateEncodingStatus(encoding);
+      const labels = { 'ansi': 'ANSI/GBK', 'utf-8': 'UTF-8', 'utf-8-bom': 'UTF-8-BOM', 'utf-16le': 'UTF-16 LE', 'utf-16be': 'UTF-16 BE' };
+      showToast('已转换为 ' + (labels[encoding] || encoding.toUpperCase()) + ' 编码', 'success');
     }
 
     function editorUndo() { if (aceEditor) aceEditor.undo(); }
@@ -3446,6 +4098,44 @@ sortedFiles.forEach(file => {
       document.addEventListener('mouseup', function() {
         isDragging = false;
       });
+      // Touch support for tablets
+      document.addEventListener('touchstart', function(e) {
+        const toolbar = document.getElementById('editorToolbar');
+        if (!toolbar || !toolbar.contains(e.target)) return;
+        if (e.target.closest('.editor-tool-btn')) return;
+        if (editorFullscreen) return;
+        const win = document.getElementById('editorWindow');
+        if (!win) return;
+        if (!win.style.left) {
+          const rect = win.getBoundingClientRect();
+          win.style.position = 'fixed';
+          win.style.left = rect.left + 'px';
+          win.style.top = rect.top + 'px';
+          win.style.width = rect.width + 'px';
+          win.style.height = rect.height + 'px';
+          document.getElementById('editorModal').style.alignItems = 'stretch';
+          document.getElementById('editorModal').style.justifyContent = 'stretch';
+        }
+        const touch = e.touches[0];
+        isDragging = true;
+        startX = touch.clientX;
+        startY = touch.clientY;
+        dragX = parseInt(win.style.left) || 0;
+        dragY = parseInt(win.style.top) || 0;
+      }, { passive: true });
+      document.addEventListener('touchmove', function(e) {
+        if (!isDragging) return;
+        const win = document.getElementById('editorWindow');
+        if (!win) return;
+        const touch = e.touches[0];
+        const dx = touch.clientX - startX;
+        const dy = touch.clientY - startY;
+        win.style.left = (dragX + dx) + 'px';
+        win.style.top = (dragY + dy) + 'px';
+      }, { passive: true });
+      document.addEventListener('touchend', function() {
+        isDragging = false;
+      });
     })();
 
     document.addEventListener('keydown', function(e) {
@@ -3467,6 +4157,15 @@ sortedFiles.forEach(file => {
       }
     });
 
+    // Mobile virtual keyboard adaptation
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', function() {
+        if (aceEditor && document.getElementById('editorModal').classList.contains('active')) {
+          aceEditor.resize();
+        }
+      });
+    }
+
     ${SHARED_SCRIPTS}
 
   </script>
@@ -3480,7 +4179,10 @@ export default {
     const method = request.method;
 
 
-    if (path === '/favicon.ico' || path === '/robots.txt' || path === '/.well-known' || path.startsWith('/.well-known/')) {
+    if (path === '/favicon.ico') {
+      return new Response(null, { status: 204 });
+    }
+    if (path === '/robots.txt' || path === '/.well-known' || path.startsWith('/.well-known/')) {
       return new Response(null, { status: 404 });
     }
 
@@ -3569,8 +4271,10 @@ export default {
           return await handleEditFile(request, env, path.slice('/api/edit'.length));
         } else if (path === '/api/search' && method === 'GET') {
           return await handleSearchFiles(request, env);
-        } else if (path === '/api/favorites') {
+        } else if (path === '/api/favorites' || path.startsWith('/api/favorites/')) {
           return await handleFavorites(request, env);
+        } else if (path === '/api/zip' && method === 'POST') {
+          return await handleZipDownload(request, env);
         } else {
           return jsonResponse({ success: false, message: 'API 路径不存在' }, 404);
         }
