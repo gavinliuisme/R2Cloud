@@ -1,5 +1,5 @@
 /**
-name = "mycloud 0.03"
+name = "mycloud"
 
 [[kv_namespaces]]
 binding = "KV_STORE"
@@ -694,6 +694,11 @@ async function handleRenameFile(request, env, path) {
 
     const parentPath = oldKey.includes('/') ? oldKey.substring(0, oldKey.lastIndexOf('/') + 1) : '';
     const newKey = parentPath + newName;
+
+    // 新旧名称相同，直接返回成功，避免先 put 再 delete 导致文件被删
+    if (oldKey === newKey) {
+      return jsonResponse({ success: true, message: '名称未变更', newPath: '/' + newKey });
+    }
 
     const oldObject = await env.R2_BUCKET.get(oldKey);
     if (!oldObject) {
@@ -2695,6 +2700,7 @@ const INDEX_PAGE = `
 
     let selectedItems = new Set();
     let lastSelectedIndex = -1;
+    let selectionAnchorIndex = -1;
     let isCtrlPressed = false;
     let isShiftPressed = false;
 
@@ -2718,7 +2724,7 @@ const INDEX_PAGE = `
             const modeLabel = data.mode === 'full' ? '全量' : '快速';
             const headerHtml = '<div style="padding:8px 14px;font-size:11px;color:var(--text-muted);border-bottom:1px solid var(--border);">搜索模式：' + modeLabel + '（扫描 ' + (data.scannedPages ?? '?') + ' 页）</div>';
             results.innerHTML = headerHtml + data.results.map(r => \`
-              <div class="search-result-item" onclick="closeSearch();navigateToFolderOrDownload('\${r.path}','\${r.name}')" oncontextmenu="event.preventDefault();closeSearch();navigateToFolderAndSelect('\${r.path}','\${r.name}');return false">
+              <div class="search-result-item" data-path="\${r.path}" data-name="\${r.name}" onclick="closeSearch();navigateToFolderOrDownload('\${r.path}','\${r.name}')" oncontextmenu="event.preventDefault();closeSearch();navigateToFolderAndSelect('\${r.path}','\${r.name}');return false">
                 <span class="search-result-icon">\${getFileIcon(r.name)}</span>
                 <div class="search-result-info">
                   <div class="search-result-name">\${highlightMatch(r.name, q)}</div>
@@ -2736,10 +2742,11 @@ const INDEX_PAGE = `
     }
 
     function handleSearchKey(event) {
-      if (event.key === 'Escape') { closeSearch(); }
       if (event.key === 'ArrowDown') { event.preventDefault(); navigateSearchResults(1); }
       if (event.key === 'ArrowUp') { event.preventDefault(); navigateSearchResults(-1); }
       if (event.key === 'Enter') { selectSearchResult(); }
+      // → 选中当前搜索结果并跳转
+      if (event.key === 'ArrowRight') { selectSearchResult(); }
     }
 
     function navigateSearchResults(dir) {
@@ -2756,7 +2763,12 @@ const INDEX_PAGE = `
 
     function selectSearchResult() {
       const item = document.querySelector('.search-result-item.search-focus');
-      if (item) item.click();
+      if (item) {
+        const path = item.dataset.path;
+        const name = item.dataset.name;
+        closeSearch();
+        navigateToFolderAndSelect(path, name);
+      }
     }
 
     function closeSearch() {
@@ -2805,24 +2817,84 @@ const INDEX_PAGE = `
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Control' || e.key === 'Meta') {
-        isCtrlPressed = true;
-      }
-      if (e.key === 'Shift') {
-        isShiftPressed = true;
-      }
-      
-      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
-        e.preventDefault();
-        selectAll();
-      }
-      
-      if (e.key === 'Delete' && selectedItems.size > 0) {
-        deleteSelected();
-      }
-      
+      if (e.key === 'Control' || e.key === 'Meta') { isCtrlPressed = true; return; }
+      if (e.key === 'Shift') { isShiftPressed = true; return; }
+
+      // Escape: 关闭所有弹层（所有场景生效）
       if (e.key === 'Escape') {
-        clearSelection();
+        e.preventDefault();
+        if (document.getElementById('editorModal')?.classList.contains('active')) closeEditor();
+        else if (document.querySelector('.modal-overlay.active')?.classList.remove('active'));
+        else if (document.getElementById('previewOverlay')?.classList.contains('active')) closePreview();
+        else if (document.getElementById('searchResults')?.classList.contains('active')) closeSearch();
+        else if (document.querySelector('.new-file-dropdown-menu.active') && closeDropdowns());
+        else clearSelection();
+        return;
+      }
+
+      if (document.querySelector('.modal-overlay.active')) return;
+
+      // Ctrl+F 搜索（输入框内也生效）
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        const si = document.getElementById('searchInput');
+        if (si) { si.focus(); si.select(); }
+        return;
+      }
+
+      const tag = e.target.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || e.target.isContentEditable) return;
+
+      const ctrl = e.ctrlKey || e.metaKey;
+      const fEl = document.getElementById('fileList');
+      const items = fEl ? Array.from(fEl.querySelectorAll('.file-item')) : [];
+
+      // 单键操作
+      if (ctrl && e.key === 'a') { e.preventDefault(); selectAll(); }
+      if (e.key === 'Delete' && selectedItems.size > 0) deleteSelected();
+      if (e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); showNewFileModal('txt'); }
+      if (e.altKey && e.key.toLowerCase() === 'm') { e.preventDefault(); showNewFolderModal(); }
+      if (e.key === 'F2' && lastSelectedIndex >= 0) {
+        e.preventDefault();
+        showRenameModal(items[lastSelectedIndex].dataset.path, items[lastSelectedIndex].dataset.name);
+      }
+      if (e.key === 'Backspace') { e.preventDefault(); ctrl ? goForward() : goBack(); }
+
+      if (!items.length) return;
+
+      // ↑↓←→ 方向键导航（[dir, step] 查找表）
+      const cols = viewMode === 'list' ? 1 : getGridColumns(fEl);
+      const arrowMap = { ArrowUp: [-1, 1], ArrowDown: [1, 1], ArrowLeft: [-1, cols], ArrowRight: [1, cols] };
+      const a = arrowMap[e.key];
+      if (a) {
+        e.preventDefault();
+        let i = lastSelectedIndex < 0 ? 0 : lastSelectedIndex + a[0] * a[1];
+        i = Math.max(0, Math.min(i, items.length - 1));
+        if (i !== lastSelectedIndex) {
+          if (e.shiftKey && selectionAnchorIndex >= 0) {
+            clearSelection();
+            selectRange(items[selectionAnchorIndex], items[i]);
+            lastSelectedIndex = i;
+          } else {
+            selectSingle(items[i]);
+          }
+          items[i].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+        return;
+      }
+
+      // Enter 打开 / x 下载 / e 编辑器
+      if (lastSelectedIndex < 0) return;
+      const el = items[lastSelectedIndex];
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        if (el.dataset.type === 'folder') navigateTo(el.dataset.path);
+        else if (el.dataset.previewType) previewFile(el.dataset.path, el.dataset.previewType, el.dataset.name);
+        else downloadFile(el.dataset.path);
+      } else if (e.key === 'x') {
+        e.preventDefault(); downloadFile(el.dataset.path);
+      } else if (e.key === 'e' && el.dataset.type !== 'folder') {
+        e.preventDefault(); openEditor(el.dataset.path, el.dataset.name);
       }
     });
 
@@ -3184,6 +3256,7 @@ function selectSingle(element) {
   selectedItems.add(key);
   element.classList.add('selected');
   lastSelectedIndex = getElementIndex(element);
+  selectionAnchorIndex = lastSelectedIndex;
   updateSelectionInfo();
 }
 
@@ -3212,6 +3285,17 @@ function getElementIndex(element) {
   const fileList = document.getElementById('fileList');
   const items = Array.from(fileList.querySelectorAll('.file-item'));
   return items.indexOf(element);
+}
+
+function getGridColumns(gridEl) {
+  const items = gridEl.querySelectorAll('.file-item');
+  if (items.length < 2) return 1;
+  const top0 = items[0].getBoundingClientRect().top;
+  let n = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (Math.abs(items[i].getBoundingClientRect().top - top0) < 1) n++; else break;
+  }
+  return n || 1;
 }
 
 function clearSelection() {
@@ -3988,11 +4072,7 @@ sortedFiles.forEach(file => {
       document.getElementById('previewContent').innerHTML = '';
     }
 
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        closePreview();
-      }
-    });
+    // 预览层 Escape 已由全局 keydown 处理
 
     async function handleFileUpload(event) {
       const files = event.target.files;
@@ -4005,6 +4085,7 @@ sortedFiles.forEach(file => {
     function showNewFolderModal() {
       document.getElementById('folderName').value = '';
       document.getElementById('newFolderModal').classList.add('active');
+      setTimeout(() => { const inp = document.getElementById('folderName'); inp.focus(); inp.select(); }, 50);
     }
 
     async function createFolder(event) {
@@ -4043,7 +4124,7 @@ sortedFiles.forEach(file => {
       document.getElementById('newFileName').value = name;
       document.getElementById('newFileContent').value = '';
       document.getElementById('newFileModal').classList.add('active');
-      setTimeout(() => { const inp = document.getElementById('newFileName'); inp.focus(); inp.select(); }, 100);
+      setTimeout(() => { const inp = document.getElementById('newFileName'); inp.focus(); inp.select(); }, 50);
     }
 
     async function createNewFile(event) {
@@ -4063,8 +4144,11 @@ sortedFiles.forEach(file => {
 
     function showRenameModal(path, currentName) {
       document.getElementById('renameFilePath').value = path;
-      document.getElementById('renameFileName').value = currentName;
       document.getElementById('renameModal').classList.add('active');
+      const inp = document.getElementById('renameFileName');
+      inp.value = currentName;
+      const dot = currentName.lastIndexOf('.');
+      setTimeout(() => { inp.focus(); dot > 0 ? inp.setSelectionRange(0, dot) : inp.select(); }, 50);
     }
 
     async function renameFile(event) {
@@ -4535,10 +4619,43 @@ sortedFiles.forEach(file => {
         e.preventDefault();
         editorGoToLine();
       }
-      
-      if (e.key === 'Escape') {
-        closeEditor();
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        editorUndo();
       }
+
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key === 'Z' && e.shiftKey) || (e.key === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        editorRedo();
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        editorFind();
+      }
+
+      if (e.key === 'Home' && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        if (aceEditor) {
+          const session = aceEditor.getSession();
+          aceEditor.gotoLine(1, 0, true);
+          aceEditor.scrollToRow(0);
+        }
+      }
+
+      if (e.key === 'End' && !e.ctrlKey && !e.metaKey) {
+        e.preventDefault();
+        if (aceEditor) {
+          const session = aceEditor.getSession();
+          const lastLine = session.getLength();
+          const lastCol = session.getLine(lastLine - 1).length;
+          aceEditor.gotoLine(lastLine, lastCol, true);
+          aceEditor.scrollToRow(lastLine - 1);
+        }
+      }
+
+      // Escape 关闭编辑器（已由全局 keydown 处理，含未保存检测）
     });
 
     // Handle virtual keyboard on mobile

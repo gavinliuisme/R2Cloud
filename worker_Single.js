@@ -1,5 +1,5 @@
 /**
- * name = "mycloud-single 0.03"
+ * name = "mycloud-single"
  * 单用户精简版 —— 仅管理员密码登录，全功能文件管理
  *
  * [[kv_namespaces]]
@@ -444,6 +444,11 @@ async function handleRenameFile(request, env, path) {
 
     const parentPath = oldKey.includes('/') ? oldKey.substring(0, oldKey.lastIndexOf('/') + 1) : '';
     const newKey = parentPath + newName;
+
+    // 名称未变更时直接返回，避免先 put 再 delete 同一 key 导致文件被删
+    if (oldKey === newKey) {
+      return jsonResponse({ success: true, message: '名称未变更', newPath: '/' + newKey });
+    }
 
     const oldObject = await env.R2_BUCKET.get(oldKey);
     if (!oldObject) {
@@ -2262,6 +2267,7 @@ const INDEX_PAGE = `
 
     let selectedItems = new Set();
     let lastSelectedIndex = -1;
+    let selectionAnchorIndex = -1;
     let isCtrlPressed = false;
     let isShiftPressed = false;
 
@@ -2313,7 +2319,7 @@ const INDEX_PAGE = `
             const modeLabel = data.mode === 'full' ? '全量' : '快速';
             const headerHtml = '<div style="padding:8px 14px;font-size:11px;color:var(--text-muted);border-bottom:1px solid var(--border);">搜索模式：' + modeLabel + '（扫描 ' + (data.scannedPages ?? '?') + ' 页）</div>';
             results.innerHTML = headerHtml + data.results.map(r => \`
-              <div class="search-result-item" onclick="closeSearch();navigateToFolderOrDownload('\${r.path}','\${r.name}')" oncontextmenu="event.preventDefault();closeSearch();navigateToFolderAndSelect('\${r.path}','\${r.name}');return false">
+              <div class="search-result-item" data-path="\${r.path}" data-name="\${r.name}" onclick="closeSearch();navigateToFolderOrDownload('\${r.path}','\${r.name}')" oncontextmenu="event.preventDefault();closeSearch();navigateToFolderAndSelect('\${r.path}','\${r.name}');return false">
                 <span class="search-result-icon">\${getFileIcon(r.name)}</span>
                 <div class="search-result-info">
                   <div class="search-result-name">\${highlightMatch(r.name, q)}</div>
@@ -2331,10 +2337,9 @@ const INDEX_PAGE = `
     }
 
     function handleSearchKey(event) {
-      if (event.key === 'Escape') { closeSearch(); }
       if (event.key === 'ArrowDown') { event.preventDefault(); navigateSearchResults(1); }
       if (event.key === 'ArrowUp') { event.preventDefault(); navigateSearchResults(-1); }
-      if (event.key === 'Enter') { selectSearchResult(); }
+      if (event.key === 'Enter' || event.key === 'ArrowRight') { selectSearchResult(); }
     }
 
     function navigateSearchResults(dir) {
@@ -2351,7 +2356,10 @@ const INDEX_PAGE = `
 
     function selectSearchResult() {
       const item = document.querySelector('.search-result-item.search-focus');
-      if (item) item.click();
+      if (item) {
+        closeSearch();
+        navigateToFolderAndSelect(item.dataset.path, item.dataset.name);
+      }
     }
 
     function closeSearch() {
@@ -2429,34 +2437,91 @@ const INDEX_PAGE = `
     });
 
     document.addEventListener('keydown', (e) => {
-      if (e.key === 'Control' || e.key === 'Meta') {
-        isCtrlPressed = true;
-      }
-      if (e.key === 'Shift') {
-        isShiftPressed = true;
-      }
-      
-      if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
-        e.preventDefault();
-        selectAll();
-      }
-      
-      if (e.key === 'Delete' && selectedItems.size > 0) {
-        deleteSelected();
-      }
-      
+      if (e.key === 'Control' || e.key === 'Meta') { isCtrlPressed = true; return; }
+      if (e.key === 'Shift') { isShiftPressed = true; return; }
+
+      // Escape 关闭所有弹层（所有场景生效）
       if (e.key === 'Escape') {
-        clearSelection();
+        e.preventDefault();
+        if (document.getElementById('editorModal')?.classList.contains('active')) closeEditor();
+        else if (document.querySelector('.modal-overlay.active')?.classList.remove('active'));
+        else if (document.getElementById('previewOverlay')?.classList.contains('active')) closePreview();
+        else if (document.getElementById('searchResults')?.classList.contains('active')) closeSearch();
+        else if (document.querySelector('.dropdown-menu.show')) document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
+        else clearSelection();
+        return;
+      }
+
+      // Ctrl+F 打开搜索（即使焦点在输入框也允许）
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        const si = document.getElementById('searchInput');
+        if (si) { si.focus(); si.select(); }
+        return;
+      }
+
+      // 弹窗打开时跳过 / 焦点在输入框时跳过
+      if (document.querySelector('.modal-overlay.active')) return;
+      if (['INPUT', 'TEXTAREA'].includes(e.target.tagName) || e.target.isContentEditable) return;
+
+      // Ctrl+A 全选 / Delete 删除
+      if ((e.ctrlKey || e.metaKey) && e.key === 'a') { e.preventDefault(); selectAll(); return; }
+      if (e.key === 'Delete' && selectedItems.size > 0) { deleteSelected(); return; }
+      // Alt+N 新建文件 / Alt+M 新建文件夹
+      if (e.altKey) {
+        const k = e.key.toLowerCase();
+        if (k === 'n') { e.preventDefault(); showNewFileModal('txt'); return; }
+        if (k === 'm') { e.preventDefault(); showNewFolderModal(); return; }
+      }
+      // Backspace 返回 / Ctrl+Backspace 前进
+      if (e.key === 'Backspace') { e.preventDefault(); (e.ctrlKey || e.metaKey) ? goForward() : goBack(); return; }
+
+      // 以下需要文件列表
+      const fEl = document.getElementById('fileList');
+      const items = fEl ? Array.from(fEl.querySelectorAll('.file-item')) : [];
+      if (!items.length) return;
+
+      // ↑↓←→ 方向键导航 + Shift 范围选择
+      const cols = viewMode === 'list' ? 1 : getGridColumns(fEl);
+      const arrowMap = { ArrowUp: [-1, 1], ArrowDown: [1, 1], ArrowLeft: [-1, cols], ArrowRight: [1, cols] };
+      if (arrowMap[e.key]) {
+        e.preventDefault();
+        const [dir, step] = arrowMap[e.key];
+        let i = lastSelectedIndex < 0 ? 0 : lastSelectedIndex + dir * step;
+        i = Math.max(0, Math.min(i, items.length - 1));
+        if (i !== lastSelectedIndex) {
+          if (e.shiftKey && selectionAnchorIndex >= 0) {
+            selectRange(items[selectionAnchorIndex], items[i]);
+            lastSelectedIndex = i;
+          } else {
+            selectSingle(items[i]);
+          }
+          items[i].scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+        }
+        return;
+      }
+
+      // F2 重命名 / x 下载 / e 编辑器 / Enter 打开（需选中项）
+      if (lastSelectedIndex >= 0) {
+        const el = items[lastSelectedIndex];
+        if (e.key === 'F2') { e.preventDefault(); showRenameModal(el.dataset.path, el.dataset.name); return; }
+        if (e.key === 'x') { e.preventDefault(); downloadFile(el.dataset.path); return; }
+        if (e.key === 'e' && el.dataset.type !== 'folder') { e.preventDefault(); openEditor(el.dataset.path, el.dataset.name); return; }
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          if (el.dataset.type === 'folder') navigateTo(el.dataset.path);
+          else {
+            const pt = el.dataset.previewType;
+            if (pt) previewFile(el.dataset.path, pt, el.dataset.name);
+            else downloadFile(el.dataset.path);
+          }
+        }
       }
     });
 
     document.addEventListener('keyup', (e) => {
-      if (e.key === 'Control' || e.key === 'Meta') {
-        isCtrlPressed = false;
-      }
-      if (e.key === 'Shift') {
-        isShiftPressed = false;
-      }
+      if (e.key === 'Control' || e.key === 'Meta') isCtrlPressed = false;
+      if (e.key === 'Shift') isShiftPressed = false;
     });
 
     window.addEventListener('DOMContentLoaded', function() {
@@ -2799,6 +2864,7 @@ function selectSingle(element) {
   selectedItems.add(key);
   element.classList.add('selected');
   lastSelectedIndex = getElementIndex(element);
+  selectionAnchorIndex = lastSelectedIndex;
   updateSelectionInfo();
 }
 
@@ -2827,6 +2893,18 @@ function getElementIndex(element) {
   const fileList = document.getElementById('fileList');
   const items = Array.from(fileList.querySelectorAll('.file-item'));
   return items.indexOf(element);
+}
+
+function getGridColumns(gridEl) {
+  const items = gridEl.querySelectorAll('.file-item');
+  if (items.length < 2) return 1;
+  const firstTop = items[0].getBoundingClientRect().top;
+  let cols = 0;
+  for (let i = 0; i < items.length; i++) {
+    if (Math.abs(items[i].getBoundingClientRect().top - firstTop) < 1) cols++;
+    else break;
+  }
+  return cols || 1;
 }
 
 function clearSelection() {
@@ -3524,12 +3602,6 @@ sortedFiles.forEach(file => {
       document.getElementById('previewContent').innerHTML = '';
     }
 
-    document.addEventListener('keydown', (e) => {
-      if (e.key === 'Escape') {
-        closePreview();
-      }
-    });
-
     async function handleFileUpload(event) {
       const files = event.target.files;
       if (!files.length) return;
@@ -3538,9 +3610,22 @@ sortedFiles.forEach(file => {
       event.target.value = '';
     }
 
+    // 弹窗输入框：50ms 后聚焦，有扩展名时只选中文件名主体，无扩展名全选
+    function focusInput(id) {
+      const inp = document.getElementById(id);
+      if (!inp) return;
+      const dot = inp.value.lastIndexOf('.');
+      setTimeout(() => {
+        inp.focus();
+        if (dot > 0) inp.setSelectionRange(0, dot);
+        else inp.select();
+      }, 50);
+    }
+
     function showNewFolderModal() {
       document.getElementById('folderName').value = '';
       document.getElementById('newFolderModal').classList.add('active');
+      focusInput('folderName');
     }
 
     function toggleNewFileDropdown(e) {
@@ -3581,7 +3666,6 @@ sortedFiles.forEach(file => {
     }
 
     function showNewFileModal(ext) {
-      // 关闭所有下拉菜单
       document.querySelectorAll('.dropdown-menu.show').forEach(m => m.classList.remove('show'));
       document.getElementById('newFileName').value = '';
       document.getElementById('newFileContent').value = '';
@@ -3589,7 +3673,7 @@ sortedFiles.forEach(file => {
       if (ext) {
         document.getElementById('newFileName').value = '新建文件.' + ext;
       }
-      setTimeout(() => document.getElementById('newFileName').focus(), 100);
+      focusInput('newFileName');
     }
 
     async function createNewFile(event) {
@@ -3728,6 +3812,7 @@ sortedFiles.forEach(file => {
       document.getElementById('renameFilePath').value = path;
       document.getElementById('renameFileName').value = currentName;
       document.getElementById('renameModal').classList.add('active');
+      focusInput('renameFileName');
     }
 
     async function renameFile(event) {
@@ -4146,14 +4231,32 @@ sortedFiles.forEach(file => {
         e.preventDefault();
         saveEditor();
       }
-      
       if ((e.ctrlKey || e.metaKey) && e.key === 'g') {
         e.preventDefault();
         editorGoToLine();
       }
-      
-      if (e.key === 'Escape') {
-        closeEditor();
+      if ((e.ctrlKey || e.metaKey) && e.key === 'z' && !e.shiftKey) {
+        e.preventDefault();
+        editorUndo();
+      }
+      if ((e.ctrlKey || e.metaKey) && (e.key === 'y' || (e.key.toLowerCase() === 'z' && e.shiftKey))) {
+        e.preventDefault();
+        editorRedo();
+      }
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        editorFind();
+      }
+      if (e.key === 'Home' && !e.ctrlKey && !e.metaKey && aceEditor) {
+        e.preventDefault();
+        aceEditor.gotoLine(1, 0, true);
+        aceEditor.scrollToRow(0);
+      }
+      if (e.key === 'End' && !e.ctrlKey && !e.metaKey && aceEditor) {
+        e.preventDefault();
+        const last = aceEditor.session.getLength();
+        aceEditor.gotoLine(last, aceEditor.session.getLine(last - 1).length, true);
+        aceEditor.scrollToRow(last - 1);
       }
     });
 
