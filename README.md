@@ -1,3 +1,4 @@
+
 # MyCloud - 轻量私有云盘 0.03
 
 基于 Cloudflare Workers + KV + R2 的全功能私有云存储系统，单文件架构，带WebDAV 的服务，零服务器成本，部署即用。
@@ -15,6 +16,10 @@
 - 重命名不变保存导致文件删除
 - 快捷键添加
 
+## 预览
+
+<img width="1217" height="684" alt="image" src="https://github.com/user-attachments/assets/ca284418-e213-45ab-9628-9b4a165439ab" />
+<img width="1217" height="686" alt="image" src="https://github.com/user-attachments/assets/a4bce4f7-f8ae-4a7e-9568-a751b153ba7a" />
 
 ## 特性概览
 
